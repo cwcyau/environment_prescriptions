@@ -27,3 +27,4 @@ This project will generate valuable preliminary evidence on how extreme weather 
 | 21/10/25 | Develop initial set of questions to be studied using data | In progress | |
 | - | Curate and create analysis ready data sets | | 
 
+All analysis scripts / files to be deposited on Github.
