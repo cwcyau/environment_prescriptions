@@ -1,0 +1,26 @@
+{
+  "flood": {
+    "mean_flagged": 0.2689764874064764,
+    "mean_nonflagged": -0.017985927276064306,
+    "std_effect_size": 0.2887938193341403,
+    "n_flagged": 29378,
+    "n_nonflagged": 589162,
+    "p_value": NaN
+  },
+  "flood_geo": {
+    "mean_flagged": -0.41409876104235926,
+    "mean_nonflagged": 0.0040735852069907486,
+    "std_effect_size": -0.4208411374947778,
+    "n_flagged": 4566,
+    "n_nonflagged": 613974,
+    "p_value": NaN
+  },
+  "drought": {
+    "mean_flagged": 0.11767424536502202,
+    "mean_nonflagged": -0.0015286894359994594,
+    "std_effect_size": 0.11996369230118849,
+    "n_flagged": 6011,
+    "n_nonflagged": 612529,
+    "p_value": NaN
+  }
+}

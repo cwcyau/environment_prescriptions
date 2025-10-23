@@ -95,7 +95,7 @@ def get_station_flags(station_guid, start_date, end_date):
 
 # parameters
 API_BASE = "https://environment.data.gov.uk/hydrology"
-prescriptions_file = "prescriptions_0501_2020-09-01_2025-08-01.nc"
+prescriptions_file = "prescriptions_0501_02_03_2020-09-01_2025-08-01.nc"
 hydrology_file = "hydrology_stations.nc"
 
 # load prescription dataset
@@ -150,5 +150,9 @@ ds_out = xr.Dataset.from_dataframe(
     prescriptions_df.set_index(["date", "row_id"])[numeric_cols]
 )
 filename = prescriptions_file.replace(".nc", "_flags.nc")
-ds_out.to_netcdf(filename)
+prescriptions_ds.close()
+try:
+    ds_out.to_netcdf(prescriptions_file)
+except Exception as e:
+    ds_out.to_netcdf(filename)
 print(ds_out)

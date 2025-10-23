@@ -1,0 +1,16 @@
+          Mixed Linear Model Regression Results
+=========================================================
+Model:            MixedLM Dependent Variable: items_adj  
+No. Observations: 490232  Method:             REML       
+No. Groups:       10905   Scale:              0.0277     
+Min. group size:  1       Log-Likelihood:     145390.7348
+Max. group size:  60      Converged:          Yes        
+Mean group size:  45.0                                   
+---------------------------------------------------------
+              Coef.  Std.Err.    z    P>|z| [0.025 0.975]
+---------------------------------------------------------
+flood          0.020    0.001  20.320 0.000  0.018  0.022
+flood_geo     -0.038    0.002 -15.324 0.000 -0.043 -0.033
+drought        0.023    0.002  10.410 0.000  0.018  0.027
+Group Var      0.925    0.076                            
+=========================================================

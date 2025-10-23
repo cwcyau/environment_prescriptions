@@ -1,0 +1,21 @@
+{
+  "median_sd_effect": {
+    "flood": 0.14999588460285485,
+    "flood_geo": -0.5164506519393192,
+    "drought": 0.8010286168093258
+  },
+  "signif_counts": {
+    "flood": {
+      "up": 318,
+      "down": 60
+    },
+    "flood_geo": {
+      "up": 5,
+      "down": 76
+    },
+    "drought": {
+      "up": 281,
+      "down": 14
+    }
+  }
+}
