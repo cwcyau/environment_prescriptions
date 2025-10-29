@@ -1,1 +1,4 @@
 *.geojson
+*.zip
+*.csv
+*.nc

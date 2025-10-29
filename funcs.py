@@ -13,9 +13,9 @@ from scipy.spatial import cKDTree
 from statsmodels.stats.multitest import multipletests
 
 MIN_GROUP_N = 3  # minimum number of flags against practice for analysis
-HYDROLOGY_API_BASE = "https://environment.data.gov.uk/hydrology"
 
 # DATA FUNCTIONS ==================================================================================
+
 def add_hydrology_flags(prescriptions_ds, hydrology_ds,
                         observed_property="rain", agg="sum",
                         flag_types=["high", "low", "median"]):
@@ -42,57 +42,53 @@ def add_hydrology_flags(prescriptions_ds, hydrology_ds,
     unique_stations = np.unique(nearest_stations)
 
     # prepare arrays for flags
-    nc_datetimes = pd.to_datetime(prescriptions_ds.date.values)
-    flags = {}
+    pres_datetimes = pd.to_datetime(prescriptions_ds.date.values)
+    pres_months = pres_datetimes.to_period("M")
+    daily_rain_datetimes = pd.to_datetime(hydrology_ds.date.values)
+    daily_rain_readings = hydrology_ds['rainfall']
+    outputs = {}
     for flag_type in flag_types:
-        flags[flag_type] = np.full((len(nc_datetimes), len(lat_p)), np.nan, dtype=np.float32)
+        outputs[flag_type] = np.full((len(pres_datetimes), len(lat_p)), np.nan, dtype=np.float32)
+    outputs["values"] = np.full((len(pres_datetimes), len(lat_p)), np.nan, dtype=np.float32)
 
     # get flags for each unique station
-    for station_id in tqdm(unique_stations, desc="Fetching station flags"):
-        # get relevant measures for this station
-        measures = fetch_station_measures(station_id)
-        if observed_property == "rain":
-            measure_id = [m for m in measures if "rainfall-t-86400" in m]
-        else:
-            raise ValueError(f"Unsupported observed_property: {observed_property}")
-        
-        # check measure found
-        if len(measure_id) == 0:
-            raise ValueError(f"No {observed_property} measure found for station {station_id}")
-        elif len(measure_id) > 1:
-            print(f"Warning: multiple {observed_property} measures found for station {station_id}," +
-                   " using the first one.")
-        measure_id = measure_id[0]
-        
-        # get readings for the measure
-        start_date = nc_datetimes.min().strftime("%Y-%m-%d")
-        end_date = nc_datetimes.max().strftime("%Y-%m-%d")
-        datetimes, values = fetch_station_readings(measure_id, start_date, end_date)
-
-        if len(datetimes) == 0:
-            print(f"No readings found for station {station_id}, measure {measure_id}.",
-                  " Setting flags to NaN.")
-            for flag_type in flag_types:
-                flags[flag_type][:, nearest_stations == station_id] = np.nan
-            continue
+    for station_id in tqdm(unique_stations,
+                           desc="      Fetching station flags",
+                           total=len(unique_stations)):
+        # get the rainfall data for this station
+        daily_station_readings = daily_rain_readings.sel(station_id=station_id).values
 
         # aggregate the data to monthly totals
-        datetimes, values = aggregate_monthly(datetimes, values, agg)
+        monthly_rain_datetimes, monthly_rain_readings = aggregate_monthly(daily_rain_datetimes,
+                                                                          daily_station_readings,
+                                                                          agg)
 
         # remove seasonal effects from readings
-        z_values = remove_seasonal_effects(datetimes, values)
+        monthly_z_values = remove_seasonal_effects(monthly_rain_datetimes,
+                                                   monthly_rain_readings)
 
         # generate flags
-        nc_months = nc_datetimes.to_period("M")
         mask = nearest_stations == station_id
         for flag_type in flag_types:
-            flags_temp = create_hydro_flags(datetimes, z_values, flag_type, nc_months)
-            flags[flag_type][:, mask] = flags_temp[:, None]
-
+            flags_temp = generate_flags(monthly_rain_datetimes,
+                                        monthly_z_values,
+                                        flag_type,
+                                        pres_months)
+            outputs[flag_type][:, mask] = flags_temp[:, None]
+        
+        # save aggregated values for nc_months
+        agg_months = pd.to_datetime(monthly_rain_datetimes).to_period("M")
+        values_series = pd.Series(monthly_rain_readings, index=agg_months)
+        aligned_values = values_series.reindex(pres_months, fill_value=np.nan).values
+        outputs["values"][:, mask] = aligned_values[:, None]
+        
     # create arrays for new flags
     for flag_type in flag_types:
-        prescriptions_ds[f"hydro_{observed_property}_{flag_type}"] = (("date", "row_id"),
-                                                                      flags[flag_type])
+        prescriptions_ds[f"hydro_{observed_property}_{flag_type}"] = (("date", "practice_id"),
+                                                                      outputs[flag_type])
+    prescriptions_ds[f"hydro_{observed_property}_values"] = (("date", "practice_id"),
+                                                             outputs["values"])
+
     return prescriptions_ds
 
 def add_geojson_flood_flags(prescriptions_ds, geojson_features,
@@ -100,7 +96,7 @@ def add_geojson_flood_flags(prescriptions_ds, geojson_features,
     """
     Add flood flags to the dataset based on geojson polygons.
     """
-    row_ids = prescriptions_ds['row_id'].values
+    practice_ids = prescriptions_ds['practice_id'].values
     lat_vec = prescriptions_ds.coords['latitude'].values
     lon_vec = prescriptions_ds.coords['longitude'].values
 
@@ -135,7 +131,8 @@ def add_geojson_flood_flags(prescriptions_ds, geojson_features,
     # generate flooding flags
     flood_flags = np.full(prescriptions_ds['items'].shape, np.nan, dtype=np.float32)
     for t_idx, date in enumerate(tqdm(prescriptions_ds['date'].values,
-                                      desc="Flagging flood months")):
+                                      desc="      Flagging flood months",
+                                      total=len(prescriptions_ds['date'].values))):
         date_period = pd.Period(pd.to_datetime(date), freq="M")
         idxs = np.where(geom_months == date_period)[0]
         if len(idxs) == 0:
@@ -152,7 +149,71 @@ def add_geojson_flood_flags(prescriptions_ds, geojson_features,
             else:
                 flood_flags[t_idx, i] = 0.0
 
-    prescriptions_ds["flood"] = (("date", "row_id"), flood_flags)
+    prescriptions_ds["flood"] = (("date", "practice_id"), flood_flags)
+    return prescriptions_ds
+
+def add_met_flags(prescriptions_ds, met_ds,
+                  observed_properties=["tmax", "rain"],
+                  flag_types=["high", "low", "median"]):
+    """
+    Add flags to the prescriptions dataset based on MET Office station data.
+
+    prescriptions_ds: xarray Dataset with 'latitude', 'longitude', 'date' coords
+    met_ds: xarray Dataset with 'latitude', 'longitude', 'date' coords
+    observed_property: str, the property to observe (e.g. "rain")
+    agg: str, the aggregation method to use (e.g. "sum")
+    flag_types: list of str, the types of flags to create (e.g. ["high", "low", "median"])
+    """
+    # get practice and station locations
+    lat_p = prescriptions_ds.latitude.values
+    lon_p = prescriptions_ds.longitude.values
+    lat_s = met_ds.latitude.values
+    lon_s = met_ds.longitude.values
+    sid_s = met_ds.station_id.values
+
+    # find nearest station for each practice
+    tree = cKDTree(np.column_stack([lat_s, lon_s]))
+    _, nearest_idx = tree.query(np.column_stack([lat_p, lon_p]))
+    nearest_stations = sid_s[nearest_idx]
+    unique_stations = np.unique(nearest_stations)
+
+    # prepare arrays for flags
+    pres_datetimes = pd.to_datetime(prescriptions_ds.date.values)
+    pres_months = pres_datetimes.to_period("M")
+    for observed_property in observed_properties:
+        print("    Adding MET flags for", observed_property)
+        outputs = {}
+        for flag_type in flag_types:
+            outputs[flag_type] = np.full((len(pres_datetimes), len(lat_p)), np.nan, dtype=np.float32)
+        outputs["values"] = np.full((len(pres_datetimes), len(lat_p)), np.nan, dtype=np.float32)
+
+        # get flags for each unique station
+        for station_id in tqdm(unique_stations, desc="      Fetching station flags"):
+            # get observed property for this station
+            values = met_ds.sel(station_id=station_id)[observed_property].values
+            met_datetimes = pd.to_datetime(met_ds.sel(station_id=station_id).date.values)
+
+            # remove seasonal effects from readings
+            z_values = remove_seasonal_effects(met_datetimes, values)
+
+            # generate flags
+            nc_months = pres_datetimes.to_period("M")
+            mask = nearest_stations == station_id
+            for flag_type in flag_types:
+                flags_temp = generate_flags(met_datetimes, z_values, flag_type, nc_months)
+                outputs[flag_type][:, mask] = flags_temp[:, None]
+                    
+            # save values for nc file time period
+            values_series = pd.Series(values, index=met_datetimes)
+            aligned_values = values_series.reindex(pres_months, fill_value=np.nan).values
+            outputs["values"][:, mask] = aligned_values[:, None]
+
+        # create arrays for new flags
+        for flag_type in flag_types:
+            prescriptions_ds[f"met_{observed_property}_{flag_type}"] = (("date", "practice_id"),
+                                                                        outputs[flag_type])
+        prescriptions_ds[f"met_{observed_property}_values"] = (("date", "practice_id"),
+                                                                outputs["values"])
     return prescriptions_ds
 
 
@@ -161,7 +222,7 @@ def plot_practices(ds, nc_file_path, sample_size=30, seed=None):
     """
     Plot prescriptions for a sample of practices.
     """
-    practices = ds['row_id'].values
+    practices = ds['practice_id'].values
     if seed is not None:
         np.random.seed(seed)
     sample_practices = practices[np.random.choice(len(practices),
@@ -170,7 +231,7 @@ def plot_practices(ds, nc_file_path, sample_size=30, seed=None):
 
     # plot prescriptions time series with flags for a sample of practices
     for practice in tqdm(sample_practices, desc="Generating plots"):
-        practice_data = ds.sel(row_id=practice)
+        practice_data = ds.sel(practice_id=practice)
         if practice_data["items"].count() == 0:
             continue
 
@@ -214,11 +275,11 @@ def mixed_effects_model(ds, flag_types, nc_file_path):
     """
     # prepare dataframe
     df_list = []
-    for practice in tqdm(ds['row_id'].values, desc="Preparing data"):
-        practice_data = ds.sel(row_id=practice).to_dataframe().reset_index()
+    for practice in tqdm(ds['practice_id'].values, desc="Preparing data"):
+        practice_data = ds.sel(practice_id=practice).to_dataframe().reset_index()
         practice_data['practice_id'] = practice
         for flag in flag_types:
-            practice_data[flag] = ds[flag].sel(row_id=practice).values
+            practice_data[flag] = ds[flag].sel(practice_id=practice).values
         df_list.append(practice_data)
 
     df = pd.concat(df_list, ignore_index=True)
@@ -371,15 +432,15 @@ def practice_analysis(ds, flag_types, nc_file_path,
     results = []
     deltas = {k:[] for k in flag_types}
     signif_counts = {k:{"up":0,"down":0} for k in deltas}
-    practices = ds['row_id'].values
+    practices = ds['practice_id'].values
     for practice in tqdm(practices,
                          desc="Per-practice analysis",
                          total=len(practices)):
-        practice_data = ds.sel(row_id=practice)
+        practice_data = ds.sel(practice_id=practice)
         if practice_data["items"].count() == 0:
             continue
 
-        items = items_norm.sel(row_id=practice).values
+        items = items_norm.sel(practice_id=practice).values
 
         for kind in deltas.keys():
             # if the flag exists for this practice, respect NaNs (unknown) by excluding them
@@ -609,7 +670,72 @@ def load_json(json_path):
         data = json.load(fh)
     return data.get("features", [])
 
-def fetch_station_measures(station_guid):
+def generate_flags(z_datetimes, z_values, flag_type, target_months, z_thresh=2.0):
+    """
+    Create simple anomaly flags (0/1) for each monthly sum of readings.
+    'flag_type' can be 'high', 'low', or 'median'.
+    """
+    # compute raw flags, preserving NaNs
+    if flag_type == "high":
+        flagged = np.where(np.isnan(z_values), np.nan, z_values >= z_thresh)
+    elif flag_type == "low":
+        flagged = np.where(np.isnan(z_values), np.nan, z_values <= -z_thresh)
+    elif flag_type == "median":
+        flagged = np.where(np.isnan(z_values), np.nan, np.abs(z_values) <= z_thresh)
+    else:
+        raise ValueError("flag_type must be 'high', 'low', or 'median'")
+
+    # convert dates to monthly periods
+    z_months = pd.to_datetime(z_datetimes).to_period("M")
+    target_months = pd.to_datetime(target_months).to_period("M")
+
+    # create output array
+    flags_out = np.full(len(target_months), np.nan, dtype=np.float32)
+
+    # vectorized mapping
+    for month in np.unique(z_months):
+        mask_target = target_months == month
+        mask_z = z_months == month
+        if np.any(mask_target):
+            flags_out[mask_target] = np.where(flagged[mask_z], 1.0, 0.0).astype(np.float32)[0]
+
+    return flags_out
+
+def remove_seasonal_effects(datetimes, values):
+    datetimes = pd.to_datetime(datetimes)
+    month_nums = datetimes.month
+    medians = np.full(12, np.nan)
+    mads = np.full(12, np.nan)
+
+    for m in range(1, 13):
+        mask = (month_nums == m)
+        if not np.any(mask):
+            continue
+        v = values[mask]
+        med = np.nanmedian(v)
+        medians[m - 1] = med
+        mads[m - 1] = np.nanmedian(np.abs(v - med)) * 1.4826
+
+    # Vectorized z-score calculation (no list comprehension)
+    m = month_nums - 1
+    monthly_anomalies = (values - medians[m]) / (mads[m] + 1e-9)
+    return monthly_anomalies
+
+def aggregate_monthly(datetimes, values, method):
+    datetimes = pd.to_datetime(datetimes)
+    df = pd.DataFrame({'date': datetimes, 'value': values})
+    df.set_index('date', inplace=True)
+    if method == "sum":
+        # ensure months with <15 days are NaN
+        monthly = df.resample('MS').sum(min_count=15)
+    else:
+        monthly = df.resample('MS').agg(method)
+    return monthly.index.values, monthly['value'].values
+
+
+# DEPRECATED ==
+HYDROLOGY_API_BASE = "https://environment.data.gov.uk/hydrology"
+def fetch_hydro_measures(station_guid):
     """Fetch all measures (timeseries) for a station."""
     url = f"{HYDROLOGY_API_BASE}/id/stations/{station_guid}/measures"
     params = {"_view": "default"}
@@ -619,7 +745,7 @@ def fetch_station_measures(station_guid):
     # return a list of measure IDs
     return [m["@id"].split("/")[-1] for m in items]
 
-def fetch_station_readings(measure_id, start_date, end_date):
+def fetch_hydro_readings_for_period(measure_id, start_date, end_date):
     """Fetch readings for a measure and return (timestamps, values) arrays."""
     url = f"{HYDROLOGY_API_BASE}/id/measures/{measure_id}/readings"
     start_date = pd.to_datetime(start_date).strftime("%Y-%m-%d")
@@ -639,39 +765,115 @@ def fetch_station_readings(measure_id, start_date, end_date):
     ])
     return datetimes, values
 
-def create_hydro_flags(z_datetimes, z_values, flag_type, target_months, z_thresh=2.0):
-    """
-    Create simple anomaly flags (0/1) for each monthly sum of readings.
-    'kind' can be 'high', 'low' or 'median'.
-    """
-    # flag by flag_type
-    if flag_type == "high":
-        flagged = z_values >= z_thresh
-    elif flag_type == "low":
-        flagged = z_values <= -z_thresh
-    elif flag_type == "median":
-        flagged = np.abs(z_values) <= z_thresh
-    else:
-        raise ValueError("kind must be 'high', 'low' or 'median'")
+def fetch_hydro_readings(measure_id):
+    """Fetch readings for a measure and return (timestamps, values) arrays."""
+    url = f"{HYDROLOGY_API_BASE}/id/measures/{measure_id}/readings"
+    params = {"_limit": 2000000}
+    r = requests.get(url, params=params, timeout=60)
+    r.raise_for_status()
+    items = r.json().get("items", [])
+    if not items:
+        return np.array([]), np.array([])
+    datetimes = np.array([pd.to_datetime(x["dateTime"]) for x in items])
+    values = np.array([
+        float(x["value"]) if "value" in x and x["value"] not in [None, ""] else np.nan
+        for x in items
+    ])
+    return datetimes, values
 
-    # map flags to target months
-    z_months = np.array([pd.Period(pd.to_datetime(m), freq="M")
-                         for m in z_datetimes])
-    flags_out = np.full(len(target_months), np.nan, dtype=np.float32)
-    for m, f in zip(z_months, flagged):
-        mask = target_months == m
-        if not np.any(mask):
-            continue
-        if np.isnan(f):
-            flags_out[mask] = np.nan
-        elif f:
-            flags_out[mask] = 1.0
+def add_hydrology_flags_old(prescriptions_ds, hydrology_ds,
+                        observed_property="rain", agg="sum",
+                        flag_types=["high", "low", "median"]):
+    """
+    Add flags to the prescriptions dataset based on hydrology station data.
+
+    prescriptions_ds: xarray Dataset with 'latitude', 'longitude', 'date' coords
+    hydrology_ds: xarray Dataset with 'latitude', 'longitude', 'date' coords
+    observed_property: str, the property to observe (e.g. "rain")
+    agg: str, the aggregation method to use (e.g. "sum")
+    flag_types: list of str, the types of flags to create (e.g. ["high", "low", "median"])
+    """
+    # get practice and station locations
+    lat_p = prescriptions_ds.latitude.values
+    lon_p = prescriptions_ds.longitude.values
+    lat_s = hydrology_ds.latitude.values
+    lon_s = hydrology_ds.longitude.values
+    sid_s = hydrology_ds.station_id.values
+
+    # find nearest station for each practice
+    tree = cKDTree(np.column_stack([lat_s, lon_s]))
+    _, nearest_idx = tree.query(np.column_stack([lat_p, lon_p]))
+    nearest_stations = sid_s[nearest_idx]
+    unique_stations = np.unique(nearest_stations)
+
+    # prepare arrays for flags
+    nc_datetimes = pd.to_datetime(prescriptions_ds.date.values)
+    nc_months = nc_datetimes.to_period("M")
+    outputs = {}
+    for flag_type in flag_types:
+        outputs[flag_type] = np.full((len(nc_datetimes), len(lat_p)), np.nan, dtype=np.float32)
+    outputs["values"] = np.full((len(nc_datetimes), len(lat_p)), np.nan, dtype=np.float32)
+
+    # get flags for each unique station
+    for station_id in tqdm(unique_stations,
+                           desc="      Fetching station flags",
+                           total=len(unique_stations)):
+        # get relevant measures for this station
+        measures = fetch_hydro_measures(station_id)
+        if observed_property == "rain":
+            measure_id = [m for m in measures if "rainfall-t-86400" in m]
         else:
-            flags_out[mask] = 0.0
+            raise ValueError(f"Unsupported observed_property: {observed_property}")
+        
+        # check measure found
+        if len(measure_id) == 0:
+            raise ValueError(f"No {observed_property} measure found for station {station_id}")
+        elif len(measure_id) > 1:
+            print(f"Warning: multiple {observed_property} measures found for station {station_id}," +
+                   " using the first one.")
+        measure_id = measure_id[0]
+        
+        # get readings for the measure
+        # start_date = nc_datetimes.min().strftime("%Y-%m-%d")
+        # end_date = nc_datetimes.max().strftime("%Y-%m-%d")
+        # datetimes, values = fetch_hydro_readings_for_period(measure_id, start_date, end_date)
+        datetimes, values = fetch_hydro_readings(measure_id)
 
-    return flags_out
+        if len(datetimes) == 0:
+            print(f"No readings found for station {station_id}, measure {measure_id}.",
+                  " Setting flags to NaN.")
+            for flag_type in flag_types:
+                outputs[flag_type][:, nearest_stations == station_id] = np.nan
+            continue
 
-def remove_seasonal_effects(datetimes, values):
+        # aggregate the data to monthly totals
+        datetimes_agg, values_agg = aggregate_monthly(datetimes, values, agg)
+
+        # remove seasonal effects from readings
+        z_values = remove_seasonal_effects(datetimes_agg, values_agg)
+
+        # generate flags
+        mask = nearest_stations == station_id
+        for flag_type in flag_types:
+            flags_temp = generate_flags(datetimes_agg, z_values, flag_type, nc_months)
+            outputs[flag_type][:, mask] = flags_temp[:, None]
+        
+        # save aggregated values for nc_months
+        agg_months = pd.to_datetime(datetimes_agg).to_period("M")
+        values_series = pd.Series(values_agg, index=agg_months)
+        aligned_values = values_series.reindex(nc_months, fill_value=np.nan).values
+        outputs["values"][:, mask] = aligned_values[:, None]
+        
+    # create arrays for new flags
+    for flag_type in flag_types:
+        prescriptions_ds[f"hydro_{observed_property}_{flag_type}"] = (("date", "practice_id"),
+                                                                      outputs[flag_type])
+    prescriptions_ds[f"hydro_{observed_property}_values"] = (("date", "practice_id"),
+                                                             outputs["values"])
+
+    return prescriptions_ds
+
+def remove_seasonal_effects_old(datetimes, values):
     # collect monthly medians and mean absolute deviations (MADs)
     # (median and MAD are more robust to outliers than mean and SD)
     month_nums = np.array([m.month for m in datetimes])
@@ -699,7 +901,7 @@ def remove_seasonal_effects(datetimes, values):
 
     return monthly_anomalies
 
-def aggregate_monthly(datetimes, values, method):
+def aggregate_monthly_old(datetimes, values, method):
     month_periods = np.array([pd.Period(t, freq="M") for t in datetimes])
     unique_months = np.unique(month_periods)
 
@@ -731,3 +933,26 @@ def aggregate_monthly(datetimes, values, method):
     # convert months back to datetimes
     unique_months = np.array([m.to_timestamp() for m in unique_months])
     return unique_months, monthly_vals
+
+def aggregate_monthly_old2(datetimes, values, method):
+    # convert to YYYYMM integer for grouping
+    datetimes = pd.to_datetime(datetimes)
+    keys = datetimes.year * 12 + datetimes.month
+    sorter = np.argsort(keys)
+    keys, values = keys[sorter], values[sorter]
+
+    unique_keys, idx_start = np.unique(keys, return_index=True)
+    idx_end = np.r_[idx_start[1:], len(values)]
+
+    agg_funcs = {
+        "sum": np.nansum,
+        "mean": np.nanmean,
+        "median": np.nanmedian,
+        "max": np.nanmax,
+        "min": np.nanmin
+    }
+    func = agg_funcs[method]
+
+    monthly_vals = np.array([func(values[i0:i1]) for i0, i1 in zip(idx_start, idx_end)])
+    months = [pd.Timestamp(year=int(k // 12), month=int(k % 12 or 12), day=1) for k in unique_keys]
+    return np.array(months), monthly_vals

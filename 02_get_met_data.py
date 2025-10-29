@@ -37,7 +37,7 @@ def parse_txt_file(file_path):
     if len(lines) < 3:
         raise ValueError(f"File {file_path} too short to parse.")
 
-    name = lines[0].strip().lower()  # station name
+    name = file_path.split('/')[-1].replace('data.txt', '')  # station name
 
     # extract longitude and latitude
     # example line: "Location: 224100E 252100N, Lat 52.139 Lon -4.570, 133 metres amsl"
