@@ -3,10 +3,10 @@ from funcs import add_hydrology_flags, add_geojson_flood_flags, add_met_flags, l
 
 # parameters
 prescriptions_paths = [
-    "data/prescriptions_02_03_0501_2020-09_2025-08.nc",
-    "data/prescriptions_02_2020-09_2025-08.nc",
-    "data/prescriptions_03_2020-09_2025-08.nc",
-    "data/prescriptions_0501_2020-09_2025-08.nc"
+    "data/prescriptions_02_03_0501_2010-08_2025-08.nc",
+    "data/prescriptions_02_2010-08_2025-08.nc",
+    "data/prescriptions_03_2010-08_2025-08.nc",
+    "data/prescriptions_0501_2010-08_2025-08.nc"
 ]
 hydrology_path = "data/hydrology_rainfall_stations.nc"
 geojson_path = "data/Recorded_Flood_Outlines.geojson"

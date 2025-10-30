@@ -12,7 +12,7 @@ from shapely.strtree import STRtree
 from scipy.spatial import cKDTree
 from statsmodels.stats.multitest import multipletests
 
-MIN_GROUP_N = 3  # minimum number of flags against practice for analysis
+MIN_GROUP_N = 5  # minimum number of flags against practice for analysis
 
 # DATA FUNCTIONS ==================================================================================
 
@@ -48,8 +48,10 @@ def add_hydrology_flags(prescriptions_ds, hydrology_ds,
     daily_rain_readings = hydrology_ds['rainfall']
     outputs = {}
     for flag_type in flag_types:
-        outputs[flag_type] = np.full((len(pres_datetimes), len(lat_p)), np.nan, dtype=np.float32)
-    outputs["values"] = np.full((len(pres_datetimes), len(lat_p)), np.nan, dtype=np.float32)
+        outputs[flag_type] = np.full((len(pres_datetimes), len(lat_p)),
+                                     np.nan, dtype=np.float32)
+    outputs["values"] = np.full((len(pres_datetimes), len(lat_p)),
+                                np.nan, dtype=np.float32)
 
     # get flags for each unique station
     for station_id in tqdm(unique_stations,
@@ -62,6 +64,7 @@ def add_hydrology_flags(prescriptions_ds, hydrology_ds,
         monthly_rain_datetimes, monthly_rain_readings = aggregate_monthly(daily_rain_datetimes,
                                                                           daily_station_readings,
                                                                           agg)
+        monthly_rain_months = pd.to_datetime(monthly_rain_datetimes).to_period("M")
 
         # remove seasonal effects from readings
         monthly_z_values = remove_seasonal_effects(monthly_rain_datetimes,
@@ -70,15 +73,14 @@ def add_hydrology_flags(prescriptions_ds, hydrology_ds,
         # generate flags
         mask = nearest_stations == station_id
         for flag_type in flag_types:
-            flags_temp = generate_flags(monthly_rain_datetimes,
+            flags_temp = generate_flags(monthly_rain_months,
                                         monthly_z_values,
                                         flag_type,
                                         pres_months)
             outputs[flag_type][:, mask] = flags_temp[:, None]
         
         # save aggregated values for nc_months
-        agg_months = pd.to_datetime(monthly_rain_datetimes).to_period("M")
-        values_series = pd.Series(monthly_rain_readings, index=agg_months)
+        values_series = pd.Series(monthly_rain_readings, index=monthly_rain_months)
         aligned_values = values_series.reindex(pres_months, fill_value=np.nan).values
         outputs["values"][:, mask] = aligned_values[:, None]
         
@@ -96,7 +98,6 @@ def add_geojson_flood_flags(prescriptions_ds, geojson_features,
     """
     Add flood flags to the dataset based on geojson polygons.
     """
-    practice_ids = prescriptions_ds['practice_id'].values
     lat_vec = prescriptions_ds.coords['latitude'].values
     lon_vec = prescriptions_ds.coords['longitude'].values
 
@@ -108,7 +109,7 @@ def add_geojson_flood_flags(prescriptions_ds, geojson_features,
     geoms = []
     months = []
     for f in tqdm(geojson_features,
-                  desc="Processing flood polygons",
+                  desc="      Processing flood polygons",
                   total=len(geojson_features)):
         start = pd.to_datetime(f["properties"].get("start_date"),
                                errors="coerce")
@@ -192,6 +193,7 @@ def add_met_flags(prescriptions_ds, met_ds,
             # get observed property for this station
             values = met_ds.sel(station_id=station_id)[observed_property].values
             met_datetimes = pd.to_datetime(met_ds.sel(station_id=station_id).date.values)
+            met_months = met_datetimes.to_period("M")
 
             # remove seasonal effects from readings
             z_values = remove_seasonal_effects(met_datetimes, values)
@@ -200,11 +202,11 @@ def add_met_flags(prescriptions_ds, met_ds,
             nc_months = pres_datetimes.to_period("M")
             mask = nearest_stations == station_id
             for flag_type in flag_types:
-                flags_temp = generate_flags(met_datetimes, z_values, flag_type, nc_months)
+                flags_temp = generate_flags(met_months, z_values, flag_type, nc_months)
                 outputs[flag_type][:, mask] = flags_temp[:, None]
                     
             # save values for nc file time period
-            values_series = pd.Series(values, index=met_datetimes)
+            values_series = pd.Series(values, index=met_months)
             aligned_values = values_series.reindex(pres_months, fill_value=np.nan).values
             outputs["values"][:, mask] = aligned_values[:, None]
 
@@ -218,7 +220,7 @@ def add_met_flags(prescriptions_ds, met_ds,
 
 
 # INSPECTION FUNCTIONS ============================================================================
-def plot_practices(ds, nc_file_path, sample_size=30, seed=None):
+def plot_practices(ds, nc_file_path, flag_types, sample_size=30, seed=None):
     """
     Plot prescriptions for a sample of practices.
     """
@@ -235,37 +237,109 @@ def plot_practices(ds, nc_file_path, sample_size=30, seed=None):
         if practice_data["items"].count() == 0:
             continue
 
-        plt.figure(figsize=(12, 6))
-        plt.plot(practice_data["date"].values,
-                practice_data["items"].values,
-                "ko-", markersize=10, alpha=0.2,
-                label="Prescriptions")
-
-        plot_args = (("drought","red","v"),
-                    ("flood","blue","v"),
-                    ("flood_geo","green","^"))
-        for kind, color, marker in plot_args:
-            if kind not in practice_data:
+        n = len(flag_types)
+        fig, axes = plt.subplots(n, 3, figsize=(18, 6*n))
+        for f, flag_type in enumerate(flag_types):
+            # get vars for this flag type
+            flag_vars = [ft for ft in practice_data.data_vars
+                         if ft.startswith(flag_type)]
+            if len(flag_vars) == 0:
                 continue
-            flagged_dates = practice_data["date"].where(practice_data[kind] == 1,
-                                                        drop=True).values
-            flagged_values = practice_data["items"].sel(date=flagged_dates).values
-            plt.scatter(flagged_dates, flagged_values,
-                        c=color, s=60, marker=marker, alpha=0.7,
-                        label=f"{kind.title()} Flag", zorder=5)
 
-        plt.title(f"Prescriptions Time Series for Practice {practice}")
-        plt.xlabel("Date")
-        plt.ylabel("Number of Prescriptions")
-        plt.legend()
-        plt.grid()
+            # plot prescriptions with flags
+            plot_prescriptions(axes[f, 0], practice_data, flag_vars)
+
+            # plot readings for flagged variable
+            plot_readings(axes[f, 1], practice_data, flag_vars)
+
+            # plot readings with seasonal correction
+            plot_readings(axes[f, 2], practice_data, flag_vars, seasonal_correction=True)
 
         # save
-        save_path = "outputs/" + nc_file_path.replace(".nc", "") + "/" + practice + ".png"
+        folder_name = nc_file_path.split('/')[-1].replace('.nc', '')
+        save_path = f"outputs/{folder_name}/{practice}.png"
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.tight_layout()
+        fig.tight_layout()
+        fig.suptitle(f"Practice ID: {practice}", y=1.02, fontsize=16)
         plt.savefig(save_path)
         plt.close()
+
+def plot_prescriptions(ax, practice_data, flag_vars):
+    datetimes = practice_data['date'].values
+    items = practice_data["items"].values
+    ax.plot(datetimes, items, "ko-", markersize=10, alpha=0.2,
+            label="Prescriptions")
+
+    # plot flagged points
+    if flag_vars is not None:
+        if len(flag_vars) == 1:
+            # mark flagged months
+            flag_var = flag_vars[0]
+            flags = practice_data[flag_var].values
+            flagged_dates = datetimes[flags == 1]
+            flagged_values = items[flags == 1]
+            ax.scatter(flagged_dates, flagged_values,
+                    c='b', s=60, marker='v', alpha=0.7,
+                    label=" ".join(flag_var.split('_')).title(),
+                    zorder=5)
+        elif len(flag_vars) == 4:
+            # mark high/low months
+            params = (("high", "r", "^"), ("low", "b", "v"))
+            for suffix, color, marker in params:
+                flag_var = [fv for fv in flag_vars if fv.endswith(suffix)][0]
+                flags = practice_data[flag_var].values
+                flagged_dates = datetimes[flags == 1]
+                flagged_values = items[flags == 1]
+                ax.scatter(flagged_dates, flagged_values,
+                        c=color, s=60, marker=marker, alpha=0.7,
+                        label=suffix.title() + " " + " ".join(flag_var.split('_')[:-1]).title(),
+                        zorder=5)
+    
+    years = pd.date_range(datetimes.min(), datetimes.max(), freq="YS")
+    ax.set_xticks(years, years.year)
+    ax.set_ylabel("Number of Prescriptions")
+    ax.legend()
+    ax.grid()
+    return ax
+
+def plot_readings(ax, practice_data, flag_vars, seasonal_correction=False):
+    # find the key for the readings
+    readings_key = [v for v in flag_vars if v.endswith("values")]
+    if len(readings_key) == 0 or len(flag_vars) <= 1:
+        return ax
+    
+    # get readings
+    datetimes = practice_data['date'].values
+    readings = practice_data[readings_key[0]].values
+
+    # correct for seasonal effects
+    if seasonal_correction:
+        readings = remove_seasonal_effects(datetimes, readings)
+
+    # plot readings
+    ax.plot(datetimes, readings, "ko-", markersize=10, alpha=0.2,
+            label="Prescriptions")
+
+    # mark high/low months
+    if flag_vars is not None:
+        params = (("high", "r", "^"), ("low", "b", "v"))
+        for suffix, color, marker in params:
+            flag_var = [fv for fv in flag_vars if fv.endswith(suffix)][0]
+            flags = practice_data[flag_var].values
+            flagged_dates = datetimes[flags == 1]
+            flagged_values = readings[flags == 1]
+            ax.scatter(flagged_dates, flagged_values,
+                    c=color, s=60, marker=marker, alpha=0.7,
+                    label=suffix.title() + " " + " ".join(flag_var.split('_')[:-1]).title(),
+                    zorder=5)
+    
+    years = pd.date_range(datetimes.min(), datetimes.max(), freq="YS")
+    ax.set_xticks(years, years.year)
+    ax.set_xlim(datetimes.min(), datetimes.max())
+    ax.set_ylabel('Corrected\n' + readings_key[0].replace('_', ' ').title())
+    ax.legend()
+    ax.grid()
+    return ax
 
 
 # ANALYSIS FUNCTIONS ==============================================================================
@@ -670,34 +744,28 @@ def load_json(json_path):
         data = json.load(fh)
     return data.get("features", [])
 
-def generate_flags(z_datetimes, z_values, flag_type, target_months, z_thresh=2.0):
+def generate_flags(z_months, z_values, flag_type, target_months, z_thresh=1.0):
     """
     Create simple anomaly flags (0/1) for each monthly sum of readings.
     'flag_type' can be 'high', 'low', or 'median'.
     """
-    # compute raw flags, preserving NaNs
+    # compute raw flags
     if flag_type == "high":
-        flagged = np.where(np.isnan(z_values), np.nan, z_values >= z_thresh)
+        flagged = z_values >= z_thresh
     elif flag_type == "low":
-        flagged = np.where(np.isnan(z_values), np.nan, z_values <= -z_thresh)
+        flagged = z_values <= -z_thresh
     elif flag_type == "median":
-        flagged = np.where(np.isnan(z_values), np.nan, np.abs(z_values) <= z_thresh)
+        flagged = np.abs(z_values) < z_thresh
     else:
         raise ValueError("flag_type must be 'high', 'low', or 'median'")
 
-    # convert dates to monthly periods
-    z_months = pd.to_datetime(z_datetimes).to_period("M")
-    target_months = pd.to_datetime(target_months).to_period("M")
-
-    # create output array
-    flags_out = np.full(len(target_months), np.nan, dtype=np.float32)
-
-    # vectorized mapping
+    # map flags to target months
+    flags_out = np.full(len(target_months), np.nan, dtype=bool)
     for month in np.unique(z_months):
         mask_target = target_months == month
-        mask_z = z_months == month
         if np.any(mask_target):
-            flags_out[mask_target] = np.where(flagged[mask_z], 1.0, 0.0).astype(np.float32)[0]
+            mask_z = z_months == month
+            flags_out[mask_target] = flagged[mask_z]
 
     return flags_out
 
@@ -716,7 +784,7 @@ def remove_seasonal_effects(datetimes, values):
         medians[m - 1] = med
         mads[m - 1] = np.nanmedian(np.abs(v - med)) * 1.4826
 
-    # Vectorized z-score calculation (no list comprehension)
+    # Vectorized z-score calculation
     m = month_nums - 1
     monthly_anomalies = (values - medians[m]) / (mads[m] + 1e-9)
     return monthly_anomalies
@@ -733,7 +801,22 @@ def aggregate_monthly(datetimes, values, method):
     return monthly.index.values, monthly['value'].values
 
 
-# DEPRECATED ==
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# DEPRECATED ======================================================================================
 HYDROLOGY_API_BASE = "https://environment.data.gov.uk/hydrology"
 def fetch_hydro_measures(station_guid):
     """Fetch all measures (timeseries) for a station."""
