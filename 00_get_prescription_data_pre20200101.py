@@ -6,6 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 from zipfile import ZipFile
+from funcs import download_file
 
 # CONFIG
 BASE_INDEX = "https://digital.nhs.uk/data-and-information/publications/statistical/practice-level-prescribing-data"
@@ -43,27 +44,6 @@ def discover_zip_links(month_page_url):
         if href.lower().endswith(".zip"):
             zip_urls.append(urljoin(month_page_url, href))
     return sorted(set(zip_urls))
-
-def download_file(url, out_dir=OUT_DIR, overwrite=False):
-    """Download file streaming to disk. Skip if already exists."""
-    fname = url.split("/")[-1]
-    out_path = out_dir / fname
-
-    if out_path.exists() and not overwrite:
-        # optionally check file size to avoid partial downloads
-        if out_path.stat().st_size > 1_000_000:  # >1MB sanity check
-            print(f"Skipping already downloaded ZIP: {fname}")
-            return out_path
-        else:
-            print(f"Re-downloading incomplete ZIP: {fname}")
-
-    with SESSION.get(url, stream=True, timeout=TIMEOUT) as r:
-        r.raise_for_status()
-        with open(out_path, "wb") as fh:
-            for chunk in r.iter_content(chunk_size=1024*1024):
-                if chunk:
-                    fh.write(chunk)
-    return out_path
 
 def extract_pdpi_csv(zip_path, csv_dir=CSV_DIR):
     """Extract the PDPI BNFT CSV from a ZIP file, skip if already exists."""
@@ -110,7 +90,7 @@ if __name__ == "__main__":
     # 3) Download ZIPs and extract PDPI BNFT CSV
     for url in tqdm(all_zip_urls, desc="Downloading and extracting"):
         try:
-            zip_path = download_file(url)
+            zip_path = download_file(url, SESSION, out_dir=OUT_DIR, timeout=TIMEOUT)
             csv_path = extract_pdpi_csv(zip_path)
             if csv_path:
                 print(f"Extracted {csv_path.name}")

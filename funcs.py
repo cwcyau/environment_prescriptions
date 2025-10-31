@@ -1,16 +1,15 @@
-import os, json, requests
+import os, json, requests, re
 import numpy as np
-import xarray as xr
 import pandas as pd
 import statsmodels.formula.api as smf
 import matplotlib.pyplot as plt
 from pyproj import Transformer
 from tqdm import tqdm
-from scipy import stats
 from shapely.geometry import shape, Point
 from shapely.strtree import STRtree
 from scipy.spatial import cKDTree
-from statsmodels.stats.multitest import multipletests
+from joblib import Parallel, delayed
+
 
 MIN_GROUP_N = 5  # minimum number of flags against practice for analysis
 
@@ -218,6 +217,68 @@ def add_met_flags(prescriptions_ds, met_ds,
                                                                 outputs["values"])
     return prescriptions_ds
 
+def add_particulate_flags(prescriptions_ds, particulates_ds, mass_z_thresh=1.5):
+    # align particulates ds to prescriptions ds
+    particulates_ds = particulates_ds.reindex(date=prescriptions_ds.date,
+                                              practice_id=prescriptions_ds.practice_id,
+                                              method=None)
+    
+    # get flags for each particulates variable
+    part_vars = particulates_ds.data_vars
+    for var in tqdm(part_vars,
+                    desc="      Fetching particulate flags",
+                    total=len(part_vars)):
+
+        is_daqi = "daqi" in var
+        values = particulates_ds[var].values
+
+        # convert mass concentration to z-scores and configure flags
+        if not is_daqi:
+            medians = np.nanmedian(values, axis=0, keepdims=True)
+            mads = np.nanmedian(np.abs(values - medians), axis=0, keepdims=True) * 1.4826
+            vals_to_flag = (values - medians) / mads
+            thresholds = {"high": (mass_z_thresh, None)}
+            flag_types = ["high"]
+        # otherwise use unprocessed DAQI monthly maximums and standard DAQI thresholds
+        else:
+            vals_to_flag = values
+            thresholds = {
+                "very_high": (10, None),
+                "high": (7, 10),
+                "moderate": (4, 7),
+                "low": (1, 4)
+            }
+            flag_types = list(thresholds.keys())
+
+        # generate flags
+        outputs = {}
+        for flag_type in flag_types:
+            low, high = thresholds[flag_type]
+            if low is None:
+                mask = vals_to_flag < high
+            elif high is None:
+                mask = vals_to_flag >= low
+            else:
+                mask = (vals_to_flag >= low) & (vals_to_flag < high)
+            # ensure mask is NaN where values are NaN
+            mask = mask.astype(np.float32)
+            mask[np.isnan(values)] = np.nan
+            outputs[flag_type] = mask
+
+        # store raw values
+        outputs["values"] = values.astype(np.float32)
+
+        # re-order name of daqi variables for new dataset
+        if is_daqi and "_daqi" in var:
+            var = "daqi_" + var.replace("_daqi", "")
+
+        # add to prescriptions dataset
+        for flag_type in flag_types:
+            prescriptions_ds[f"aqrean_{var}_{flag_type}"] = (("date", "practice_id"), outputs[flag_type])
+        prescriptions_ds[f"aqrean_{var}_values"] = (("date", "practice_id"), outputs["values"])
+
+    return prescriptions_ds
+
 
 # INSPECTION FUNCTIONS ============================================================================
 def plot_practices(ds, nc_file_path, flag_types, sample_size=30, seed=None):
@@ -282,6 +343,16 @@ def plot_prescriptions(ax, practice_data, flag_vars):
                     c='b', s=60, marker='v', alpha=0.7,
                     label=" ".join(flag_var.split('_')).title(),
                     zorder=5)
+        elif len(flag_vars) == 2:
+            # mark high months
+            flag_var = [fv for fv in flag_vars if fv.endswith("high")][0]
+            flags = practice_data[flag_var].values
+            flagged_dates = datetimes[flags == 1]
+            flagged_values = items[flags == 1]
+            ax.scatter(flagged_dates, flagged_values,
+                    c='r', s=60, marker='^', alpha=0.7,
+                    label=" ".join(flag_var.split('_')).title(),
+                    zorder=5)
         elif len(flag_vars) == 4:
             # mark high/low months
             params = (("high", "r", "^"), ("low", "b", "v"))
@@ -294,6 +365,23 @@ def plot_prescriptions(ax, practice_data, flag_vars):
                         c=color, s=60, marker=marker, alpha=0.7,
                         label=suffix.title() + " " + " ".join(flag_var.split('_')[:-1]).title(),
                         zorder=5)
+        elif len(flag_vars) == 5:
+            # mark very_high/high/low/months
+            params = (("very_high", "m", "D"), ("high", "r", "^"),
+                      ("moderate", "y", "o"), ("low", "g", "v"))
+            for suffix, color, marker in params:
+                if suffix == "high":
+                    flag_var = [fv for fv in flag_vars if fv.endswith("high")
+                                and "very" not in fv][0]
+                else:
+                    flag_var = [fv for fv in flag_vars if fv.endswith(suffix)][0]
+                flags = practice_data[flag_var].values
+                flagged_dates = datetimes[flags == 1]
+                flagged_values = items[flags == 1]
+                ax.scatter(flagged_dates, flagged_values,
+                           c=color, s=60, marker=marker, alpha=0.7,
+                           label=suffix.title() + " " + " ".join(flag_var.split('_')[:-1]).title(),
+                           zorder=5)
     
     years = pd.date_range(datetimes.min(), datetimes.max(), freq="YS")
     ax.set_xticks(years, years.year)
@@ -306,8 +394,9 @@ def plot_readings(ax, practice_data, flag_vars, seasonal_correction=False):
     # find the key for the readings
     readings_key = [v for v in flag_vars if v.endswith("values")]
     if len(readings_key) == 0 or len(flag_vars) <= 1:
+        # no readings variable or just a simple flag (e.g. flood)
         return ax
-    
+
     # get readings
     datetimes = practice_data['date'].values
     readings = practice_data[readings_key[0]].values
@@ -316,12 +405,24 @@ def plot_readings(ax, practice_data, flag_vars, seasonal_correction=False):
     if seasonal_correction:
         readings = remove_seasonal_effects(datetimes, readings)
 
-    # plot readings
+    # plot readings baseline
     ax.plot(datetimes, readings, "ko-", markersize=10, alpha=0.2,
-            label="Prescriptions")
+            label="Readings")
 
-    # mark high/low months
-    if flag_vars is not None:
+    # plot flagged months depending on how many flag vars exist
+    if len(flag_vars) == 2:
+        # high + values
+        flag_var = [fv for fv in flag_vars if fv.endswith("high")][0]
+        flags = practice_data[flag_var].values
+        flagged_dates = datetimes[flags == 1]
+        flagged_values = readings[flags == 1]
+        ax.scatter(flagged_dates, flagged_values,
+                   c='r', s=60, marker='^', alpha=0.7,
+                   label=" ".join(flag_var.split('_')).title(),
+                   zorder=5)
+
+    elif len(flag_vars) == 4:
+        # high/low + values
         params = (("high", "r", "^"), ("low", "b", "v"))
         for suffix, color, marker in params:
             flag_var = [fv for fv in flag_vars if fv.endswith(suffix)][0]
@@ -329,331 +430,38 @@ def plot_readings(ax, practice_data, flag_vars, seasonal_correction=False):
             flagged_dates = datetimes[flags == 1]
             flagged_values = readings[flags == 1]
             ax.scatter(flagged_dates, flagged_values,
-                    c=color, s=60, marker=marker, alpha=0.7,
-                    label=suffix.title() + " " + " ".join(flag_var.split('_')[:-1]).title(),
-                    zorder=5)
-    
+                       c=color, s=60, marker=marker, alpha=0.7,
+                       label=suffix.title() + " " + " ".join(flag_var.split('_')[:-1]).title(),
+                       zorder=5)
+
+    elif len(flag_vars) == 5:
+        # DAQI-style very_high/high/moderate/low + values
+        params = (("very_high", "m", "D"), ("high", "r", "^"),
+                  ("moderate", "y", "o"), ("low", "g", "v"))
+        for suffix, color, marker in params:
+            if suffix == "high":
+                flag_var = [fv for fv in flag_vars if fv.endswith("high") and "very" not in fv][0]
+            else:
+                flag_var = [fv for fv in flag_vars if fv.endswith(suffix)][0]
+            flags = practice_data[flag_var].values
+            flagged_dates = datetimes[flags == 1]
+            flagged_values = readings[flags == 1]
+            ax.scatter(flagged_dates, flagged_values,
+                       c=color, s=60, marker=marker, alpha=0.7,
+                       label=suffix.title() + " " + " ".join(flag_var.split('_')[:-1]).title(),
+                       zorder=5)
+
     years = pd.date_range(datetimes.min(), datetimes.max(), freq="YS")
     ax.set_xticks(years, years.year)
     ax.set_xlim(datetimes.min(), datetimes.max())
-    ax.set_ylabel('Corrected\n' + readings_key[0].replace('_', ' ').title())
+    ax.set_ylabel(('Corrected\n' if seasonal_correction else '') +
+                  readings_key[0].replace('_', ' ').title())
     ax.legend()
     ax.grid()
     return ax
 
 
 # ANALYSIS FUNCTIONS ==============================================================================
-def mixed_effects_model(ds, flag_types, nc_file_path):
-    """
-    Fit a mixed-effects model to the prescription data.
-    """
-    # prepare dataframe
-    df_list = []
-    for practice in tqdm(ds['practice_id'].values, desc="Preparing data"):
-        practice_data = ds.sel(practice_id=practice).to_dataframe().reset_index()
-        practice_data['practice_id'] = practice
-        for flag in flag_types:
-            practice_data[flag] = ds[flag].sel(practice_id=practice).values
-        df_list.append(practice_data)
-
-    df = pd.concat(df_list, ignore_index=True)
-    df = df.dropna(subset=['items'])
-
-    # convert flags to integers
-    df[flag_types] = df[flag_types].astype(int)
-
-    # remove month-of-year effects globally
-    df['items_adj'] = df['items'] - df.groupby(df['date'].dt.month)['items'].transform('mean')
-
-    # optionally scale and clip extreme values
-    sd_global = df['items_adj'].std()
-    df['items_adj'] = df['items_adj'] / (sd_global + 1e-9)
-    df['items_adj'] = df['items_adj'].clip(-5, 5)
-
-    # fit mixed-effects model
-    model_formula = 'items_adj ~ ' + ' + '.join(flag_types) + ' - 1'
-    md = smf.mixedlm(model_formula, df, groups=df['practice_id'])
-    mdf = md.fit(method='lbfgs', reml=True)
-
-    # print and save results
-    summary = mdf.summary()
-    print(summary)
-
-    save_path = os.path.join("outputs", nc_file_path.replace(".nc", ""), "mixed_effects_result.txt")
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    with open(save_path, "w") as f:
-        f.write(str(summary))
-
-def global_analysis(ds, flag_types, nc_file_path,
-                    min_group_n=MIN_GROUP_N, jitter_eps=1e-6,
-                    n_boot=1000, n_perm=1000, seed=None):
-    """
-    Perform global analysis on the prescription data.
-    """
-    # month-normalization per practice
-    month_numbers = ds["date"].dt.month
-    def month_center_per_practice(x):
-        return x.groupby(month_numbers).map(lambda m: m - m.mean(dim="date"))
-    items_norm = month_center_per_practice(ds["items"])
-
-    # scale each practice to avoid domination by high-prescription practices
-    items_scaled = items_norm / (items_norm.std(dim="date") + 1e-9)
-
-    # flatten arrays for global testing
-    items_flat = items_scaled.values.flatten()
-
-    global_results = {}
-    for kind in tqdm(flag_types, desc="Global analysis", total=len(flag_types)):
-        if kind not in ds:
-            continue
-        flag_arr = ds[kind].values.flatten().astype(float)
-        is_nan = np.isnan(flag_arr)
-        is_one = flag_arr == 1
-        is_zero = flag_arr == 0
-
-        # flagged: explicit ones; nonflagged: explicit zeros only (exclude NaNs)
-        flagged = items_flat[is_one]
-        nonflagged = items_flat[is_zero & ~is_nan]
-
-        if len(flagged) < min_group_n or len(nonflagged) < min_group_n:
-            continue
-
-        # add tiny jitter to avoid ties
-        flagged_j = flagged + np.random.normal(0, jitter_eps, flagged.shape)
-        nonflagged_j = nonflagged + np.random.normal(0, jitter_eps, nonflagged.shape)
-
-        mean_flag = np.nanmean(flagged_j)
-        mean_non = np.nanmean(nonflagged_j)
-
-        # pooled standard deviation for standardized effect size
-        pooled_sd = np.nanstd(np.concatenate([flagged_j, nonflagged_j])) + 1e-9
-        std_effect = (mean_flag - mean_non) / pooled_sd
-
-        # statistical testing
-        try:
-            _, pval = stats.mannwhitneyu(flagged_j, nonflagged_j,
-                                        alternative="two-sided",
-                                        method="asymptotic")
-        except:
-            pval = np.nan
-
-        # bootstrap using helper (for both mean diff and std effect)
-        boot_res = bootstrap_effects(flagged_j, nonflagged_j,
-                                     n_boot=n_boot, jitter_eps=jitter_eps,
-                                     min_group_n=min_group_n, seed=seed)
-        if boot_res is not None:
-            se_lo, se_hi = boot_res.get("std_effect_ci", [None, None])
-            md_lo, md_hi = boot_res.get("mean_diff_ci", [None, None])
-            boot_pval = boot_res.get("boot_pval")
-            mean_diff_boot_p = boot_res.get("mean_diff_boot_p")
-        else:
-            se_lo = se_hi = md_lo = md_hi = None
-            boot_pval = None
-            mean_diff_boot_p = None
-
-        # permutation p-value for mean difference (and optionally std effect)
-        try:
-            mean_diff_perm_p = permutation_pvalue(lambda a, b: float(np.nanmean(a) - np.nanmean(b)),
-                                                  flagged_j, nonflagged_j, n_perm=n_perm, seed=seed)
-        except Exception:
-            mean_diff_perm_p = None
-        try:
-            std_effect_perm_p = permutation_pvalue(lambda a, b: float((np.nanmean(a) - np.nanmean(b)) /
-                                                                      (np.nanstd(np.concatenate([a, b])) + 1e-9)),
-                                                   flagged_j, nonflagged_j, n_perm=n_perm, seed=seed)
-        except Exception:
-            std_effect_perm_p = None
-
-        global_results[kind] = {
-            "mean_flagged": float(mean_flag),
-            "mean_nonflagged": float(mean_non),
-            "mean_diff_size": float(mean_flag - mean_non),
-            "mean_diff_ci": [None if md_lo is None else float(md_lo),
-                             None if md_hi is None else float(md_hi)],
-            "mean_diff_boot_p": mean_diff_boot_p,
-            "mean_diff_perm_p": mean_diff_perm_p,
-            "mannwhitney_p": float(pval),
-            "std_effect_size": float(std_effect),
-            "std_effect_ci": [None if se_lo is None else float(se_lo),
-                              None if se_hi is None else float(se_hi)],
-            "std_effect_boot_p": boot_pval,
-            "std_effect_perm_p": std_effect_perm_p,
-            "n_flagged": len(flagged),
-            "n_nonflagged": len(nonflagged),
-        }
-
-    # print results
-    print("Global analysis results:")
-    for k, v in global_results.items():
-        print(f"  {k}: {v}")
-
-    # save output
-    save_path = "outputs/" + nc_file_path.replace(".nc", "") + "/global_analysis_results.json"
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    with open(save_path, "w") as f:
-        json.dump(global_results, f, indent=2)
-
-def practice_analysis(ds, flag_types, nc_file_path,
-                      min_group_n=MIN_GROUP_N, n_boot=500,
-                      n_perm=1000, seed=None):
-    # month-normalization per practice
-    month_numbers = ds["date"].dt.month
-    def month_center_per_practice(x):
-        return x.groupby(month_numbers).apply(lambda m: m - m.mean(dim="date"))
-    items_norm = month_center_per_practice(ds["items"])
-
-    # loop through each practice and analyse flagged vs non-flagged prescription counts
-    results = []
-    deltas = {k:[] for k in flag_types}
-    signif_counts = {k:{"up":0,"down":0} for k in deltas}
-    practices = ds['practice_id'].values
-    for practice in tqdm(practices,
-                         desc="Per-practice analysis",
-                         total=len(practices)):
-        practice_data = ds.sel(practice_id=practice)
-        if practice_data["items"].count() == 0:
-            continue
-
-        items = items_norm.sel(practice_id=practice).values
-
-        for kind in deltas.keys():
-            # if the flag exists for this practice, respect NaNs (unknown) by excluding them
-            if kind in practice_data:
-                arr = practice_data[kind].values.astype(float)
-                is_nan = np.isnan(arr)
-                is_one = arr == 1
-                is_zero = arr == 0
-
-                # flagged: explicit ones; nonflagged: explicit zeros only (exclude NaNs)
-                flag_vals = items[is_one]
-                nonflag_vals = items[is_zero & ~is_nan]
-            else:
-                # flag variable absent -> no flagged observations, all are valid non-flagged
-                flag_vals = items[np.zeros_like(items, dtype=bool)]
-                nonflag_vals = items
-
-            if len(flag_vals)<min_group_n or len(nonflag_vals)<min_group_n:
-                continue
-
-            mean_flag = np.nanmean(flag_vals)
-            mean_non = np.nanmean(nonflag_vals)
-            pooled_sd = np.nanstd(np.concatenate([flag_vals, nonflag_vals])) + 1e-9
-            std_effect = (mean_flag - mean_non) / pooled_sd
-
-            try:
-                _, pval = stats.mannwhitneyu(flag_vals, nonflag_vals,
-                                             alternative="two-sided")
-            except:
-                pval = np.nan
-
-            # bootstrap per-practice using helper (CI and bootstrap p-values)
-            boot_res = bootstrap_effects(flag_vals, nonflag_vals, n_boot=n_boot,
-                                         jitter_eps=1e-6, min_group_n=min_group_n,
-                                         seed=seed)
-            if boot_res is not None:
-                se_lo, se_hi = boot_res.get("std_effect_ci", [None, None])
-                md_lo, md_hi = boot_res.get("mean_diff_ci", [None, None])
-                boot_pval = boot_res.get("boot_pval")
-                mean_diff_boot_p = boot_res.get("mean_diff_boot_p")
-            else:
-                se_lo = se_hi = md_lo = md_hi = None
-                boot_pval = None
-                mean_diff_boot_p = None
-
-            # permutation p-values for mean diff and standardized effect
-            try:
-                mean_diff_perm_p = permutation_pvalue(lambda a, b: float(np.nanmean(a) - np.nanmean(b)), 
-                                                      flag_vals, nonflag_vals, n_perm=n_perm, seed=seed)
-            except Exception:
-                mean_diff_perm_p = None
-            try:
-                std_effect_perm_p = permutation_pvalue(lambda a, b: float((np.nanmean(a) - np.nanmean(b)) / (np.nanstd(np.concatenate([a, b])) + 1e-9)),
-                                                       flag_vals, nonflag_vals, n_perm=n_perm, seed=seed)
-            except Exception:
-                std_effect_perm_p = None
-
-            results.append({
-                "practice_id": practice,
-                "kind": kind,
-                "mean_flagged": float(mean_flag),
-                "mean_nonflagged": float(mean_non),
-                "mean_diff_size": float(mean_flag - mean_non),
-                "mean_diff_ci": [None if md_lo is None else float(md_lo),
-                                 None if md_hi is None else float(md_hi)],
-                "mannwhitney_p": float(pval),
-                "mean_diff_boot_p": mean_diff_boot_p,
-                "mean_diff_perm_p": mean_diff_perm_p,
-                "std_effect_size": float(std_effect),
-                "std_effect_ci": [None if se_lo is None else float(se_lo),
-                                  None if se_hi is None else float(se_hi)],
-                "std_effect_boot_p": boot_pval,
-                "std_effect_perm_p": std_effect_perm_p,
-                "n_flagged": int(len(flag_vals)),
-                "n_nonflagged": int(len(nonflag_vals)),
-            })
-
-            deltas[kind].append(std_effect)
-            alpha = 0.05
-            if not np.isnan(pval) and pval<alpha:
-                if std_effect > 0:
-                    signif_counts[kind]["up"] += 1
-                elif std_effect < 0:
-                    signif_counts[kind]["down"] += 1
-
-    # print and save outputs
-    results_df = pd.DataFrame(results)
-
-    # perform FDR (Benjamini-Hochberg) corrections on per-practice p-values where present
-    if not results_df.empty:
-        # ensure columns exist
-        for col in ["mannwhitney_p", "mean_diff_perm_p", "std_effect_perm_p"]:
-            if col not in results_df.columns:
-                results_df[col] = np.nan
-
-        mw_p = results_df["mannwhitney_p"].fillna(1.0).values
-        md_p = results_df["mean_diff_perm_p"].fillna(1.0).values
-        se_p = results_df["std_effect_perm_p"].fillna(1.0).values
-
-        try:
-            _, mw_q, _, _ = multipletests(mw_p, alpha=0.05, method="fdr_bh")
-            _, md_q, _, _ = multipletests(md_p, alpha=0.05, method="fdr_bh")
-            _, se_q, _, _ = multipletests(se_p, alpha=0.05, method="fdr_bh")
-        except Exception:
-            mw_q = np.ones_like(mw_p)
-            md_q = np.ones_like(md_p)
-            se_q = np.ones_like(se_p)
-
-        results_df["mannwhitney_q"] = mw_q
-        results_df["mean_diff_perm_q"] = md_q
-        results_df["std_effect_perm_q"] = se_q
-        results_df["mannwhitney_fdr_sig"] = results_df["mannwhitney_q"] <= 0.05
-        results_df["mean_diff_perm_fdr_sig"] = results_df["mean_diff_perm_q"] <= 0.05
-        results_df["std_effect_perm_fdr_sig"] = results_df["std_effect_perm_q"] <= 0.05
-
-    save_filename = nc_file_path.replace(".nc", "_per_practice_analysis.csv")
-    results_df.to_csv(save_filename, index=False)
-
-    # summary including FDR counts
-    signif_counts_fdr = {k: {"mannwhitney_fdr": 0, "mean_diff_perm_fdr": 0, "std_effect_perm_fdr": 0} for k in deltas}
-    if not results_df.empty:
-        for kind in deltas.keys():
-            sub = results_df[results_df["kind"] == kind]
-            if not sub.empty:
-                signif_counts_fdr[kind]["mannwhitney_fdr"] = int(sub["mannwhitney_fdr_sig"].sum())
-                signif_counts_fdr[kind]["mean_diff_perm_fdr"] = int(sub["mean_diff_perm_fdr_sig"].sum())
-                signif_counts_fdr[kind]["std_effect_perm_fdr"] = int(sub["std_effect_perm_fdr_sig"].sum())
-
-    summary = {
-        "median_sd_effect": {k: float(np.nanmedian(v)) for k, v in deltas.items()},
-        "signif_counts": signif_counts,
-        "signif_counts_fdr": signif_counts_fdr
-    }
-    print(summary)
-    save_path = "outputs/" + nc_file_path.replace(".nc", "") + "/per_practice_summary.json"
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    with open(save_path, "w") as f:
-        json.dump(summary, f, indent=2)
-
 
 # HELPER FUNCTIONS ================================================================================
 def bootstrap_effects(flagged, nonflagged, n_boot=1000, jitter_eps=1e-6,
@@ -703,6 +511,27 @@ def bootstrap_effects(flagged, nonflagged, n_boot=1000, jitter_eps=1e-6,
         "boot_pval": boot_pval,
         "mean_diff_boot_p": float(2.0 * min(np.mean(boot_md > 0), 1.0 - np.mean(boot_md > 0)))
     }
+
+def download_file(url, session, out_dir='', timeout=20, overwrite=False):
+    """Download file streaming to disk. Skip if already exists."""
+    fname = url.split("/")[-1]
+    out_path = out_dir / fname
+
+    if out_path.exists() and not overwrite:
+        # optionally check file size to avoid partial downloads
+        if out_path.stat().st_size > 1_000_000:  # >1MB sanity check
+            print(f"Skipping already downloaded ZIP: {fname}")
+            return out_path
+        else:
+            print(f"Re-downloading incomplete ZIP: {fname}")
+
+    with session.get(url, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as fh:
+            for chunk in r.iter_content(chunk_size=1024*1024):
+                if chunk:
+                    fh.write(chunk)
+    return out_path
 
 def permutation_pvalue(stat_fn, a, b, n_perm=1000, seed=None):
     """
