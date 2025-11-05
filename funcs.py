@@ -1,20 +1,26 @@
-import os, json, requests, re
+import os, json, requests, re, logging, sys
 import numpy as np
 import pandas as pd
+import bambi as bmb
+import arviz as az
 import statsmodels.formula.api as smf
 import matplotlib.pyplot as plt
+import pymc as pm
+from datetime import datetime
 from pyproj import Transformer
 from tqdm import tqdm
 from shapely.geometry import shape, Point
 from shapely.strtree import STRtree
 from scipy.spatial import cKDTree
 from joblib import Parallel, delayed
+from typing import List, Dict
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 
 MIN_GROUP_N = 5  # minimum number of flags against practice for analysis
 
 # DATA FUNCTIONS ==================================================================================
-
 def add_hydrology_flags(prescriptions_ds, hydrology_ds,
                         observed_property="rain", agg="sum",
                         flag_types=["high", "low", "median"]):
@@ -181,7 +187,7 @@ def add_met_flags(prescriptions_ds, met_ds,
     pres_datetimes = pd.to_datetime(prescriptions_ds.date.values)
     pres_months = pres_datetimes.to_period("M")
     for observed_property in observed_properties:
-        print("    Adding MET flags for", observed_property)
+        status("    Adding MET flags for", observed_property)
         outputs = {}
         for flag_type in flag_types:
             outputs[flag_type] = np.full((len(pres_datetimes), len(lat_p)), np.nan, dtype=np.float32)
@@ -269,8 +275,11 @@ def add_particulate_flags(prescriptions_ds, particulates_ds, mass_z_thresh=1.5):
         outputs["values"] = values.astype(np.float32)
 
         # re-order name of daqi variables for new dataset
-        if is_daqi and "_daqi" in var:
-            var = "daqi_" + var.replace("_daqi", "")
+        if is_daqi:
+            if var == "daqi":
+                var = "daqi_overall"
+            else:
+                var = "daqi_" + var.replace("_daqi", "")
 
         # add to prescriptions dataset
         for flag_type in flag_types:
@@ -278,6 +287,90 @@ def add_particulate_flags(prescriptions_ds, particulates_ds, mass_z_thresh=1.5):
         prescriptions_ds[f"aqrean_{var}_values"] = (("date", "practice_id"), outputs["values"])
 
     return prescriptions_ds
+
+# DATA HELPERS ====================================================================================
+def download_file(url, session, out_dir='', timeout=20, overwrite=False):
+    """Download file streaming to disk. Skip if already exists."""
+    fname = url.split("/")[-1]
+    out_path = out_dir / fname
+
+    if out_path.exists() and not overwrite:
+        # optionally check file size to avoid partial downloads
+        if out_path.stat().st_size > 1_000_000:  # >1MB sanity check
+            status(f"Skipping already downloaded ZIP: {fname}")
+            return out_path
+        else:
+            status(f"Re-downloading incomplete ZIP: {fname}")
+
+    with session.get(url, stream=True, timeout=timeout) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as fh:
+            for chunk in r.iter_content(chunk_size=1024*1024):
+                if chunk:
+                    fh.write(chunk)
+    return out_path
+
+def load_json(json_path):
+    """Load JSON file and return features list."""
+    with open(json_path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    return data.get("features", [])
+
+def generate_flags(z_months, z_values, flag_type, target_months, z_thresh=1.0):
+    """
+    Create simple anomaly flags (0/1) for each monthly sum of readings.
+    'flag_type' can be 'high', 'low', or 'median'.
+    """
+    # compute raw flags
+    if flag_type == "high":
+        flagged = z_values >= z_thresh
+    elif flag_type == "low":
+        flagged = z_values <= -z_thresh
+    elif flag_type == "median":
+        flagged = np.abs(z_values) < z_thresh
+    else:
+        raise ValueError("flag_type must be 'high', 'low', or 'median'")
+
+    # map flags to target months
+    flags_out = np.full(len(target_months), np.nan, dtype=bool)
+    for month in np.unique(z_months):
+        mask_target = target_months == month
+        if np.any(mask_target):
+            mask_z = z_months == month
+            flags_out[mask_target] = flagged[mask_z]
+
+    return flags_out
+
+def remove_seasonal_effects(datetimes, values):
+    datetimes = pd.to_datetime(datetimes)
+    month_nums = datetimes.month
+    medians = np.full(12, np.nan)
+    mads = np.full(12, np.nan)
+
+    for m in range(1, 13):
+        mask = (month_nums == m)
+        if not np.any(mask):
+            continue
+        v = values[mask]
+        med = np.nanmedian(v)
+        medians[m - 1] = med
+        mads[m - 1] = np.nanmedian(np.abs(v - med)) * 1.4826
+
+    # Vectorized z-score calculation
+    m = month_nums - 1
+    monthly_anomalies = (values - medians[m]) / (mads[m] + 1e-9)
+    return monthly_anomalies
+
+def aggregate_monthly(datetimes, values, method):
+    datetimes = pd.to_datetime(datetimes)
+    df = pd.DataFrame({'date': datetimes, 'value': values})
+    df.set_index('date', inplace=True)
+    if method == "sum":
+        # ensure months with <15 days are NaN
+        monthly = df.resample('MS').sum(min_count=15)
+    else:
+        monthly = df.resample('MS').agg(method)
+    return monthly.index.values, monthly['value'].values
 
 
 # INSPECTION FUNCTIONS ============================================================================
@@ -462,176 +555,613 @@ def plot_readings(ax, practice_data, flag_vars, seasonal_correction=False):
 
 
 # ANALYSIS FUNCTIONS ==============================================================================
-
-# HELPER FUNCTIONS ================================================================================
-def bootstrap_effects(flagged, nonflagged, n_boot=1000, jitter_eps=1e-6,
-                      min_group_n=MIN_GROUP_N, seed=None):
+def run_all_flag_mixed_models(
+    ds,
+    flag_types: List[str],
+    results_folder: str,
+    seasonal_correction: bool = True,
+    practice_correction: int = 0,
+    min_practice_obs: int = 20,
+    n_jobs: int = 1,
+):
     """
-    Compute bootstrap estimates for mean difference and standardized effect between two samples.
+    Runs mixed-effects models comparing prescription 'items' across requested flag groups.
 
-    Returns a dict with keys:
-      - 'std_effect_ci': [lo, hi]
-      - 'mean_diff_ci': [lo, hi]
-      - 'boot_pval': two-sided bootstrap p-value for standardized effect
-
-    If inputs are too small for bootstrapping, returns None.
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Dataset containing 'items' and flag variables (indexed by date, practice_id).
+    flag_types : list of str
+        Base flag names to test, e.g. ["hydro_rain","met_tmax","flood","aqrean_carbon_monoxide","aqrean_daqi", ...]
+        The function will look for derived variable names (e.g. hydro_rain_high, hydro_rain_median, ...).
+    results_folder : str
+        Folder path for saving results.
+    seasonal_correction : bool
+        Whether to add month-of-year fixed effects: " + C(month)".
+    practice_correction : int
+        Whether to add practice-level fixed effects:
+        0 = none,
+        1 = random intercepts,
+        2 = random intercepts + slopes.
+    min_practice_obs : int
+        Practices excluded if they have fewer than this number of observations.
+    n_jobs : int
+        Number of parallel jobs (joblib).
     """
-    f = np.asarray(flagged)
-    nf = np.asarray(nonflagged)
-    # remove nans
-    f = f[~np.isnan(f)]
-    nf = nf[~np.isnan(nf)]
 
-    if len(f) < min_group_n or len(nf) < min_group_n or not n_boot or n_boot <= 0:
-        return None
+    def fit_mixed_effects(df: pd.DataFrame, formula: str, re_formula: str, group_var="practice_id") -> Dict:
+        out = dict(coef=np.nan, pval=np.nan, ci_low=np.nan, ci_high=np.nan, error=None)
+        try:
+            md = smf.mixedlm(formula, df, groups=df[group_var], re_formula=re_formula)
+            mdf = md.fit(method="lbfgs", reml=True, disp=False)
+            # expected coefficient name is 'flag_binary' in formula
+            if "flag_binary" in mdf.params:
+                coef = float(mdf.params["flag_binary"])
+                pval = float(mdf.pvalues.get("flag_binary", np.nan))
+                ci_low, ci_high = map(float, mdf.conf_int().loc["flag_binary"].values)
+            else:
+                coef = np.nan
+                pval = np.nan
+                ci_low, ci_high = [np.nan, np.nan]
+            out.update(dict(coef=coef, pval=pval, ci_low=ci_low, ci_high=ci_high))
+        except Exception as e:
+            out.update(dict(error=str(e)))
+        return out
 
-    rng = np.random.default_rng(seed)
-    boot_std = np.empty(n_boot)
-    boot_md = np.empty(n_boot)
-    for i in range(n_boot):
-        f_samp = rng.choice(f, size=len(f), replace=True)
-        nf_samp = rng.choice(nf, size=len(nf), replace=True)
-        # add tiny jitter to avoid degenerate ties
-        f_samp_j = f_samp + rng.normal(0, jitter_eps, f_samp.shape)
-        nf_samp_j = nf_samp + rng.normal(0, jitter_eps, nf_samp.shape)
-        mean_f = np.nanmean(f_samp_j)
-        mean_nf = np.nanmean(nf_samp_j)
-        pooled = np.nanstd(np.concatenate([f_samp_j, nf_samp_j])) + 1e-9
-        boot_md[i] = mean_f - mean_nf
-        boot_std[i] = (mean_f - mean_nf) / pooled
+    # build tasks from requested flag_types =======================================================
+    tasks = []  # each task is tuple (family, task_name, task_args)
+    seen_task_names = set()
 
-    se_lo, se_hi = np.percentile(boot_std, [2.5, 97.5])
-    md_lo, md_hi = np.percentile(boot_md, [2.5, 97.5])
-    prop_pos = np.mean(boot_std > 0)
-    boot_pval = float(2.0 * min(prop_pos, 1.0 - prop_pos))
+    def add_task(family, name, *args):
+        if name in seen_task_names:
+            return
+        seen_task_names.add(name)
+        tasks.append((family, name, *args))
 
-    return {
-        "std_effect_ci": [float(se_lo), float(se_hi)],
-        "mean_diff_ci": [float(md_lo), float(md_hi)],
-        "boot_pval": boot_pval,
-        "mean_diff_boot_p": float(2.0 * min(np.mean(boot_md > 0), 1.0 - np.mean(boot_md > 0)))
-    }
+    # helper to check existence of variable(s) in ds and warn if missing
+    def vars_exist(*vars_to_check) -> bool:
+        missing = [v for v in vars_to_check if v not in ds]
+        if missing:
+            status(f"Missing variables in ds (skipping comparison): {missing}")
+            return False
+        return True
 
-def download_file(url, session, out_dir='', timeout=20, overwrite=False):
-    """Download file streaming to disk. Skip if already exists."""
-    fname = url.split("/")[-1]
-    out_path = out_dir / fname
+    for base in flag_types:
+        # flood (single var: flood)
+        # compare flood == 1 to flood == 0
+        if base == "flood":
+            if vars_exist("flood"):
+                add_task("flood", "flood_vs_not", "flood")
+            else:
+                status("Requested 'flood' but variable 'flood' not found in dataset.")
 
-    if out_path.exists() and not overwrite:
-        # optionally check file size to avoid partial downloads
-        if out_path.stat().st_size > 1_000_000:  # >1MB sanity check
-            print(f"Skipping already downloaded ZIP: {fname}")
-            return out_path
+        # hydro_/met_ (high/low/median/values)
+        # compare high vs median, low vs median
+        elif base.startswith("hydro_") or base.startswith("met_"):
+            high = f"{base}_high"
+            median = f"{base}_median"
+            low = f"{base}_low"
+            # high vs median
+            if vars_exist(high, median):
+                add_task("hydro_met", f"{base}_high_vs_median", high, median)
+            # low vs median
+            if vars_exist(low, median):
+                add_task("hydro_met", f"{base}_low_vs_median", low, median)
+
+        # aqrean_daqi (very_high/high/moderate/low/values)
+        # compare (high + very_high) vs (low + moderate), (high + very_high + moderate) vs low
+        elif base.startswith("aqrean_daqi"):
+            levels = [f"{base}_{lvl}" for lvl in ("very_high", "high", "moderate", "low")]
+            if vars_exist(*levels):
+                # pair1: (high + very_high) vs (low + moderate)
+                add_task("daqi", f"{base}_high+vhigh_vs_low+mod", tuple(levels), "pair1")
+                # pair2: (high + very_high + moderate) vs low
+                add_task("daqi", f"{base}_high+vhigh+mod_vs_low", tuple(levels), "pair2")
+            else:
+                status(f"Requested {base} but one or more DAQI level variables are missing: {levels}")
+
+        # aqrean mass pollutants (high/values)
+        # compare high == 1 vs high == 0
+        elif base.startswith("aqrean_"):
+            high = f"{base}_high"
+            if vars_exist(high):
+                add_task("aqrean_mass", f"{base}_high_vs_not", high)
+            else:
+                status(f"Requested {base} but variable {high} not found.")
+
         else:
-            print(f"Re-downloading incomplete ZIP: {fname}")
+            status(f"Unknown flag_type '{base}' requested — skipping.")
 
-    with session.get(url, stream=True, timeout=timeout) as r:
-        r.raise_for_status()
-        with open(out_path, "wb") as fh:
-            for chunk in r.iter_content(chunk_size=1024*1024):
-                if chunk:
-                    fh.write(chunk)
-    return out_path
+    if not tasks:
+        status("No valid comparison tasks built — nothing to run.")
+        return pd.DataFrame([])
 
-def permutation_pvalue(stat_fn, a, b, n_perm=1000, seed=None):
+    # prepare a base dataframe (items + month + index) ============================================
+    status("Preparing base dataframe from dataset...")
+    ds = prepare_ds(ds)
+    df_items = ds["items"].to_dataframe().reset_index()
+    df_items["date"] = pd.to_datetime(df_items["date"])
+    df_items["month"] = df_items["date"].dt.month
+    df_items = df_items.set_index(["date", "practice_id"])
+    df_index = df_items.index
+
+    # run tasks ===================================================================================
+    def run_task(task):
+        family = task[0]
+        name = task[1]
+        args = task[2:]
+        df_model = df_items[["items", "month"]].copy()
+        df_model["date_code"] = df_model.index.get_level_values("date").map(ds["date_code"].to_series())
+        df_model["practice_id"] = df_model.index.get_level_values("practice_id")
+
+        # generate correct binary field for flag/family type
+        if family == "hydro_met":
+            var_flag = args[0]  # high/low variable (depending on task)
+            var_med = args[1]   # median variable
+            if var_flag not in ds or var_med not in ds:
+                return dict(name=name, coef=np.nan, pval=np.nan, ci_low=np.nan, ci_high=np.nan,
+                            error=f"at least one var missing from: {args}")
+            # get series aligned to same index
+            s_flag = ds[var_flag].to_dataframe()[var_flag].reindex(df_index)
+            s_med = ds[var_med].to_dataframe()[var_med].reindex(df_index)
+            # flag_binary: 1 if flag==1, 0 if med==1, else NaN
+            flag_binary = np.where(s_flag == 1, 1,
+                                   np.where(s_med == 1, 0, np.nan))
+            df_model["flag_binary"] = flag_binary
+
+        elif family == "flood" or family == "aqrean_mass":
+            var = args[0]
+            if var not in ds:
+                return dict(name=name, coef=np.nan, pval=np.nan, ci_low=np.nan, ci_high=np.nan,
+                            error=f"at least one var missing from: {args}")
+            s_f = ds[var].to_dataframe()[var].reindex(df_index)
+            # 1 if flood==1, 0 if flood==0, else NaN
+            flag_binary = np.where(s_f == 1, 1, np.where(s_f == 0, 0, np.nan))
+            df_model["flag_binary"] = flag_binary
+
+        elif family == "daqi":
+            levels_tuple = args[0]  # tuple of the four level var names
+            pair_kind = args[1]     # "pair1" or "pair2"
+            # unpack levels expected order: (very_high, high, moderate, low)
+            very_high, high, moderate, low = levels_tuple
+            if not all(v in ds for v in (very_high, high, moderate, low)):
+                return dict(name=name, coef=np.nan, pval=np.nan, ci_low=np.nan, ci_high=np.nan,
+                            error="missing daqi levels")
+            df_daqi = pd.DataFrame(index=df_index)
+            df_daqi["vh"] = ds[very_high].to_dataframe()[very_high].reindex(df_index)
+            df_daqi["h"]  = ds[high].to_dataframe()[high].reindex(df_index)
+            df_daqi["m"]  = ds[moderate].to_dataframe()[moderate].reindex(df_index)
+            df_daqi["l"]  = ds[low].to_dataframe()[low].reindex(df_index)
+            # define aggregated flags
+            flag_high = np.where((df_daqi["vh"] == 1) | (df_daqi["h"] == 1), 1, 0)
+            flag_mod  = np.where(df_daqi["m"] == 1, 1, 0)
+            flag_low  = np.where(df_daqi["l"] == 1, 1, 0)
+            # create mask where any value is present to preserve nans
+            any_known = (~df_daqi[["vh", "h", "m", "l"]].isna()).any(axis=1)
+            # compute binary per pair
+            if pair_kind == "pair1":
+                # (high+vhigh) vs (low+moderate)
+                cond1 = (flag_high == 1)
+                cond0 = (flag_low == 1) | (flag_mod == 1)
+                flag_binary = np.where(cond1, 1, np.where(cond0, 0, np.nan))
+                flag_binary = np.where(any_known, flag_binary, np.nan)
+            else:
+                # pair2: (high+vhigh+moderate) vs low
+                cond1 = (flag_high == 1) | (flag_mod == 1)
+                cond0 = (flag_low == 1)
+                flag_binary = np.where(cond1, 1, np.where(cond0, 0, np.nan))
+                flag_binary = np.where(any_known, flag_binary, np.nan)
+
+            df_model["flag_binary"] = flag_binary
+
+        else:
+            return dict(name=name, coef=np.nan, pval=np.nan, ci_low=np.nan, ci_high=np.nan, error="unknown family")
+
+        # collapse to rows where both items and flag_binary are present
+        df_model_clean = df_model.dropna(subset=["items", "flag_binary"]).copy()
+
+        # filter practices with at least min_practice_obs
+        df_model_clean = df_model_clean.reset_index(drop=True)
+        practice_counts = df_model_clean.groupby("practice_id").size()
+        valid_practices = practice_counts[practice_counts >= min_practice_obs].index
+        df_model_clean = df_model_clean[df_model_clean["practice_id"].isin(valid_practices)]
+
+        if df_model_clean.empty:
+            return dict(name=name, coef=np.nan, pval=np.nan, ci_low=np.nan, ci_high=np.nan,
+                        error=f"No practices with >= {min_practice_obs} observations")
+
+        # add month if seasonal correction requested
+        if seasonal_correction:
+            formula = "items ~ flag_binary + C(month)"
+        else:
+            formula = "items ~ flag_binary"
+        
+        # define random effects formula
+        if practice_correction == 0:
+            re_formula = None
+        elif practice_correction == 1:
+            re_formula = "~1"
+        elif practice_correction == 2:
+            re_formula = "~1 + date_code"
+
+        # fit model
+        fit_res = fit_mixed_effects(df_model_clean, formula, re_formula=re_formula)
+        fit_res["name"] = name
+        return fit_res
+
+    # run tasks in parallel (if requested) ========================================================
+    status(f"Running mixed-effects models for {len(tasks)} tasks (n_jobs={n_jobs})...")
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(run_task)(task) for task in tqdm(tasks)
+    )
+
+    # save results ================================================================================
+    results_df = pd.DataFrame(results)
+    os.makedirs(results_folder, exist_ok=True)
+    # save csv results
+    out_csv = os.path.join(results_folder, "mixed_effects_flag_results.csv")
+    results_df.to_csv(out_csv, index=False)
+    status(f"Results saved to {out_csv}")
+    # save pretty results text
+    out_txt = os.path.join(results_folder, "mixed_effects_flag_results.txt")
+    max_name_len = results_df["name"].str.len().max()
+    max_coef_len = results_df["coef"].apply(lambda x: len(f"{x:.2f}")).max()
+    max_ci_len = results_df[["ci_low", "ci_high"]].map(lambda x: len(f"{x:.2f}") if pd.notna(x) else 4).max().max()
+    max_pval_len = results_df["pval"].apply(lambda x: len(f"{x:.3g}") if pd.notna(x) else 4).max()
+    with open(out_txt, "w") as f:
+        for row in results_df.itertuples():
+            name_str = row.name.ljust(max_name_len)
+            coef_str = f"{row.coef:.2f}".rjust(max_coef_len) if pd.notna(row.coef) else "NaN".rjust(max_coef_len)
+            ci_str = f"(CI: {row.ci_low:.2f}, {row.ci_high:.2f})".ljust(max_ci_len+10) if pd.notna(row.ci_low) and pd.notna(row.ci_high) else "(CI: NaN, NaN)".ljust(max_ci_len+16)
+            pval_str = f"p = {row.pval:.3g}".rjust(max_pval_len+5) if pd.notna(row.pval) else "p = NaN".rjust(max_pval_len+5)
+            error_str = f"** error: {row.error}" if pd.notna(row.error) and row.error != "" else ""
+            f.write(f"{name_str}  {coef_str}  {ci_str}  {pval_str}  {error_str}\n")
+
+    return results_df
+
+def run_all_value_mixed_models(
+    ds,
+    value_vars: List[str],
+    results_folder: str,
+    seasonal_correction: bool = True,
+    practice_correction: int = 0,
+    min_practice_obs: int = 20,
+    n_jobs: int = 1,
+    standardise: bool = True,
+):
     """
-    Compute a two-sided permutation p-value for statistic stat_fn(a, b).
-    stat_fn should accept two 1D arrays and return a scalar.
-    Returns float p-value.
+    Runs mixed-effects models comparing prescription 'items' using raw continuous measurements.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Dataset containing 'items' and continuous variables (indexed by date, practice_id).
+    value_vars : list of str
+        Names of variables to test as predictors, e.g. ["hydro_rain", "met_tmax", "aqrean_pm10"].
+    results_folder : str
+        Folder path for saving results.
+    seasonal_correction : bool
+        Whether to add month-of-year fixed effects.
+    practice_correction : int
+        Level of practice-level random effects correction:
+        0 = no practice correction,
+        1 = random intercept per practice,
+        2 = random intercept + slope on date_code per practice.
+    min_practice_obs : int
+        Practices excluded if they have fewer than this number of observations.
+    n_jobs : int
+        Number of parallel jobs.
+    standardize : bool
+        Whether to standardize each predictor to mean=0, std=1.
     """
-    a = np.asarray(a)
-    b = np.asarray(b)
-    # remove nans
-    a = a[~np.isnan(a)]
-    b = b[~np.isnan(b)]
-    if len(a) == 0 or len(b) == 0:
-        return None
 
-    rng = np.random.default_rng(seed)
-    obs = stat_fn(a, b)
-    pooled = np.concatenate([a, b])
-    n = len(a)
-    perms = 0
-    ge = 0
-    for i in range(n_perm):
-        idx = rng.choice(len(pooled), size=len(pooled), replace=False)
-        # permuted groups by shuffling and splitting
-        perm = pooled[idx]
-        pa = perm[:n]
-        pb = perm[n:]
-        pstat = stat_fn(pa, pb)
-        if abs(pstat) >= abs(obs):
-            ge += 1
-        perms += 1
+    def fit_mixed_effects(df: pd.DataFrame, formula: str, re_formula: str, group_var="practice_id") -> Dict:
+        out = dict(coef=np.nan, pval=np.nan, ci_low=np.nan, ci_high=np.nan, error=None)
+        try:
+            md = smf.mixedlm(formula, df, groups=df[group_var], re_formula=re_formula)
+            mdf = md.fit(method="lbfgs", reml=True, disp=False)
+            predictor = formula.split("~")[1].split("+")[0].strip()
+            if predictor in mdf.params:
+                coef = float(mdf.params[predictor])
+                pval = float(mdf.pvalues.get(predictor, np.nan))
+                ci_low, ci_high = map(float, mdf.conf_int().loc[predictor].values)
+                out.update(dict(coef=coef, pval=pval, ci_low=ci_low, ci_high=ci_high))
+        except Exception as e:
+            out.update(dict(error=str(e)))
+        return out
 
-    pval = float((ge + 1) / (perms + 1))
-    return pval
+    # prepare base dataframe
+    ds = prepare_ds(ds)
+    df_items = ds[["items"]].to_dataframe().reset_index()
+    df_items["date"] = pd.to_datetime(df_items["date"])
+    df_items["month"] = df_items["date"].dt.month
+    df_items = df_items.set_index(["date", "practice_id"])
+    df_index = df_items.index
 
-def load_json(json_path):
-    """Load JSON file and return features list."""
-    with open(json_path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    return data.get("features", [])
+    tasks = []
+    for var in value_vars:
+        if var in ds:
+            tasks.append(var)
+        else:
+            status(f"Variable '{var}' not found in dataset — skipping.")
 
-def generate_flags(z_months, z_values, flag_type, target_months, z_thresh=1.0):
+    if not tasks:
+        status("No valid variables to run.")
+        return pd.DataFrame([])
+    
+    if practice_correction == 0:
+        re_formula = None
+    elif practice_correction == 1:
+        re_formula = "~1"
+    elif practice_correction == 2:
+        re_formula = "~1 + date_code"
+
+    def run_task(var):
+        # prepare the dataframe for this variable
+        df_model = df_items[["items", "month"]].copy()
+        df_model["date_code"] = df_model.index.get_level_values("date").map(ds["date_code"].to_series())
+        df_model["practice_id"] = df_model.index.get_level_values("practice_id")
+        s_var = ds[var].to_dataframe()[var].reindex(df_index)
+        if standardise:
+            s_var = (s_var - s_var.mean()) / s_var.std()
+        df_model[var] = s_var
+
+        # filter to practices with at least min_practice_obs observations
+        df_model_clean = df_model.dropna(subset=["items", var]).copy()
+        df_model_clean = df_model_clean.reset_index(drop=True)
+        practice_counts = df_model_clean.groupby("practice_id").size()
+        valid_practices = practice_counts[practice_counts >= min_practice_obs].index
+        df_model_clean = df_model_clean[df_model_clean["practice_id"].isin(valid_practices)]
+        if df_model_clean.empty:
+            return dict(name=var, coef=np.nan, pval=np.nan, ci_low=np.nan, ci_high=np.nan,
+                        error=f"No practices with >= {min_practice_obs} observations")
+        
+        # fit model
+        formula = f"items ~ {var}" + (" + C(month)" if seasonal_correction else "")
+        res = fit_mixed_effects(df_model_clean, formula, re_formula=re_formula)
+        res["name"] = var
+        return res
+
+    # run tasks in parallel if requested
+    status(f"Running mixed-effects models for {len(tasks)} variables (n_jobs={n_jobs})...")
+    results = Parallel(n_jobs=n_jobs)(delayed(run_task)(var) for var in tqdm(tasks))
+
+    # save results
+    results_df = pd.DataFrame(results)
+    os.makedirs(results_folder, exist_ok=True)
+    out_csv = os.path.join(results_folder, "mixed_effects_values_results.csv")
+    results_df.to_csv(out_csv, index=False)
+    status(f"Results saved to {out_csv}")
+
+    # pretty text output
+    out_txt = os.path.join(results_folder, "mixed_effects_values_results.txt")
+    max_name_len = results_df["name"].str.len().max()
+    max_coef_len = results_df["coef"].apply(lambda x: len(f"{x:.2f}") if pd.notna(x) else 4).max()
+    max_ci_len = results_df[["ci_low","ci_high"]].map(lambda x: len(f"{x:.2f}") if pd.notna(x) else 4).max().max()
+    max_pval_len = results_df["pval"].apply(lambda x: len(f"{x:.3g}") if pd.notna(x) else 4).max()
+    with open(out_txt, "w") as f:
+        for row in results_df.itertuples():
+            name_str = row.name.ljust(max_name_len)
+            coef_str = f"{row.coef:.2f}".rjust(max_coef_len) if pd.notna(row.coef) else "NaN".rjust(max_coef_len)
+            ci_str = f"(CI: {row.ci_low:.2f}, {row.ci_high:.2f})".ljust(max_ci_len+10) if pd.notna(row.ci_low) else "(CI: NaN, NaN)".ljust(max_ci_len+16)
+            pval_str = f"p = {row.pval:.3g}".rjust(max_pval_len+5) if pd.notna(row.pval) else "p = NaN".rjust(max_pval_len+5)
+            error_str = f"** error: {row.error}" if pd.notna(row.error) and row.error != "" else ""
+            f.write(f"{name_str}  {coef_str}  {ci_str}  {pval_str}  {error_str}\n")
+
+    return results_df
+
+def run_bayesian_raw_model(
+    ds,
+    raw_vars: list,
+    results_folder: str,
+    use_pca: bool = False,
+    n_components: int = None,
+    seasonal_correction: bool = True,
+    practice_correction: int = 1,
+    n_practices: int = None,
+    min_practice_obs: int = 20,
+    interactions: list = None,
+    poly_terms: dict = None,
+    draws: int = 2000,
+    tune: int = 1000,
+    chains: int = 4,
+    cores: int = 4,
+):
     """
-    Create simple anomaly flags (0/1) for each monthly sum of readings.
-    'flag_type' can be 'high', 'low', or 'median'.
+    Fit a hierarchical Bayesian model of prescription 'items' using raw environmental variables.
+    
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Dataset containing 'items' and raw variables.
+    raw_vars : list of str
+        Raw variable names to include as predictors.
+    results_folder : str
+        Folder path for saving results.
+    use_pca : bool
+        If True, apply PCA to predictors and use PCs as covariates.
+    n_components : int or None
+        Number of PCA components; if None, keep all.
+    seasonal_correction : bool
+        Whether to include month-of-year as categorical covariate.
+    practice_correction : int
+        Level of practice-specific random effects: 0 = none, 1 = intercept only, 2 = intercept + slope, 3 = intercept + slope + correlation.
+    practice_n : int or None
+        If specified, limit practices to this many with the most items (for testing).
+    interactions : list of str
+        Interactions to include, specified as "base1 x base2". Bases matched to variable names.
+    poly_terms : dict
+        Dictionary of {var_name: max_power} to create polynomial terms.
+    draws, tune, chains : int
+        Sampling parameters for Bambi.
+    
+    Returns
+    -------
+    model : bambi.Model
+        Fitted model.
+    idata : arviz.InferenceData
+        Posterior draws.
     """
-    # compute raw flags
-    if flag_type == "high":
-        flagged = z_values >= z_thresh
-    elif flag_type == "low":
-        flagged = z_values <= -z_thresh
-    elif flag_type == "median":
-        flagged = np.abs(z_values) < z_thresh
+    # system configuration
+    os.makedirs(results_folder, exist_ok=True)
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger("pymc")
+    logger.setLevel(logging.INFO)
+
+    # dataset configuration
+    status("Preparing dataset for Bayesian modeling...")
+    ds = prepare_ds(ds, n_practices=n_practices)
+
+    # prepare dataframe
+    status("Preparing dataframe for model input...")
+    df = ds[["items", "date_code"] + raw_vars].to_dataframe().reset_index()
+    df["date"] = pd.to_datetime(df["date"])
+    df["month"] = df["date"].dt.month
+    df = df.dropna(subset=["items"]).copy()
+    predictors = raw_vars.copy()
+
+    # PCA if requested
+    if use_pca:
+        status("Applying PCA to raw variables...")
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(df[predictors])
+        pca = PCA(n_components=n_components)
+        pcs = pca.fit_transform(X_scaled)
+        pc_names = [f"PC{i+1}" for i in range(pcs.shape[1])]
+        df_pca = pd.DataFrame(pcs, columns=pc_names, index=df.index)
+        df = pd.concat([df, df_pca], axis=1)
+        predictors = pc_names
+
+    # polynomial terms
+    if poly_terms is not None:
+        status("Adding polynomial terms...")
+        poly_predictors = []
+        for var, power in poly_terms.items():
+            if var not in df.columns:
+                status(f"Warning: variable {var} not in dataframe, skipping polynomial term.")
+                continue
+            for p in range(2, power+1):
+                col_name = f"{var}_pow{p}"
+                df[col_name] = df[var]**p
+                poly_predictors.append(col_name)
+        predictors += poly_predictors
+
+    # build interaction terms
+    interaction_terms = []
+    if interactions and not use_pca:
+        status("Adding interaction terms...")
+        for inter in interactions:
+            lhs, rhs = [b.strip() for b in inter.split(" x ")]
+
+            # match raw_vars with wildcard support
+            def match_pattern(pattern):
+                pat = pattern.replace("*", ".*")  # convert shell * to regex
+                regex = re.compile(f"^{pat}_values$")
+                return [v for v in raw_vars if regex.match(v)]
+            lhs_vars = match_pattern(lhs)
+            rhs_vars = match_pattern(rhs)
+
+            # raise error if no matches
+            if not lhs_vars or not rhs_vars:
+                raise ValueError(
+                    f"Interaction '{inter}' produced no matches.\n"
+                    f"  LHS matched: {lhs_vars}\n"
+                    f"  RHS matched: {rhs_vars}\n"
+                    f"  Check interaction pattern or raw_vars list."
+                )
+
+            # build all pairwise terms, excluding self-self
+            for a in lhs_vars:
+                for b in rhs_vars:
+                    if a != b:  # prevent self x self
+                        term = f"{a}*{b}"
+                        alt_term = f"{b}*{a}"
+                        if term not in interaction_terms and alt_term not in interaction_terms:  # avoid duplicates
+                            interaction_terms.append(term)
+
+        # finally add them to predictors
+        predictors += interaction_terms
+
+    # build formula
+    formula = "items ~ " + " + ".join(predictors)
+    if seasonal_correction:
+        formula += " + C(month)"
+    if practice_correction == 1:
+        formula += " + (1|practice_id)"
+    elif practice_correction == 2:
+        formula += " + (1 + date_code||practice_id)"
+    elif practice_correction == 3:
+        formula += " + (1 + date_code|practice_id)"
+    elif practice_correction != 0:
+        raise ValueError("practice_correction must be 0, 1, 2, or 3")
+
+    # clear out any nan predictors
+    df = df.dropna(subset=predictors).copy()
+    df = df[['items'] + predictors + ['practice_id', 'month', 'date_code']]
+
+    # filter practices
+    practice_counts = df.groupby('practice_id').size()
+    valid_practices = practice_counts[practice_counts >= min_practice_obs].index
+    df = df[df['practice_id'].isin(valid_practices)]
+    if df.empty:
+        raise ValueError("No practices with sufficient observations after filtering.")
     else:
-        raise ValueError("flag_type must be 'high', 'low', or 'median'")
+        status(f"Using {len(valid_practices)} practices with >= {min_practice_obs} observations.")
 
-    # map flags to target months
-    flags_out = np.full(len(target_months), np.nan, dtype=bool)
-    for month in np.unique(z_months):
-        mask_target = target_months == month
-        if np.any(mask_target):
-            mask_z = z_months == month
-            flags_out[mask_target] = flagged[mask_z]
+    # fit Bayesian model
+    status("Fitting hierarchical Bayesian model with Bambi...")
+    model = bmb.Model(formula, df)
+    progress_callback = make_progress_callback(draws, tune)
+    idata = model.fit(draws=draws,
+                      tune=tune,
+                      chains=chains,
+                      cores=cores,
+                      progressbar=False,
+                      callbacks=[progress_callback])
 
-    return flags_out
+    # save summary
+    summary_df = az.summary(idata)
+    summary_csv = os.path.join(results_folder, "bayesian_raw_model_summary.csv")
+    summary_df.to_csv(summary_csv)
 
-def remove_seasonal_effects(datetimes, values):
-    datetimes = pd.to_datetime(datetimes)
-    month_nums = datetimes.month
-    medians = np.full(12, np.nan)
-    mads = np.full(12, np.nan)
+    # prettier text summary
+    out_txt = os.path.join(results_folder, "bayesian_raw_model_summary.txt")
+    max_name_len = summary_df.index.str.len().max()
+    with open(out_txt, "w") as f:
+        for var, row in summary_df.iterrows():
+            mean = row['mean']
+            hdi_3pc = row['hdi_3%']
+            hdi_97pc = row['hdi_97%']
+            f.write(f"{var.ljust(max_name_len)} : {mean:8.2f} (CI: {hdi_3pc:8.2f}, {hdi_97pc:8.2f})\n")
 
-    for m in range(1, 13):
-        mask = (month_nums == m)
-        if not np.any(mask):
-            continue
-        v = values[mask]
-        med = np.nanmedian(v)
-        medians[m - 1] = med
-        mads[m - 1] = np.nanmedian(np.abs(v - med)) * 1.4826
+    status(f"Posterior summary saved to:\n{summary_csv}\n{out_txt}")
+    return model, idata
 
-    # Vectorized z-score calculation
-    m = month_nums - 1
-    monthly_anomalies = (values - medians[m]) / (mads[m] + 1e-9)
-    return monthly_anomalies
+# ANALYSIS HELPERS ================================================================================
+def prepare_ds(ds, n_practices=None):
+    """Prepare dataset for analysis by filtering practices with insufficient data."""
+    ds["date_code"] = ("date", np.arange(len(ds["date"])))  # integer months since start
+    ds["date_code"] = (ds["date_code"] - ds["date_code"].mean()) / ds["date_code"].std()  # standardised
+    if n_practices is not None:
+        practice_counts = ds["items"].sum(dim="date").sortby(ds["items"].sum(dim="date"), ascending=False)
+        top_practices = practice_counts["practice_id"].values[:n_practices]
+        status(f"Limiting to top {n_practices} practices with most items")
+        ds = ds.sel(practice_id=top_practices)
+    return ds
 
-def aggregate_monthly(datetimes, values, method):
-    datetimes = pd.to_datetime(datetimes)
-    df = pd.DataFrame({'date': datetimes, 'value': values})
-    df.set_index('date', inplace=True)
-    if method == "sum":
-        # ensure months with <15 days are NaN
-        monthly = df.resample('MS').sum(min_count=15)
-    else:
-        monthly = df.resample('MS').agg(method)
-    return monthly.index.values, monthly['value'].values
+def make_progress_callback(total_draws, total_tune):
+    def progress_callback(trace, draw_idx, tune_idx, chain):
+        pct = int((draw_idx + tune_idx + 1) / (total_draws + total_tune) * 100)
+        if pct % 10 == 0:
+            print(f"Chain {chain}, {pct}% complete", flush=True)
+    return progress_callback
 
-
-
-
+# GENERAL HELPERS =================================================================================
+def status(*message):
+    '''Works like the Python print function but preceded by current datetime in a similar
+       format to tensorflow logging.'''
+    message = " ".join([str(m) for m in message])
+    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f:"), message, flush=True)
 
 
 

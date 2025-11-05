@@ -1,5 +1,5 @@
 *.geojson
 *.zip
-*.csv
+data/prescriptions_pre20200101/csvs/*
 *.nc
 __pycache__/

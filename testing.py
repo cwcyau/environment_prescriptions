@@ -1,14 +1,12 @@
-import xarray as xr
-import matplotlib.pyplot as plt
-from funcs import remove_seasonal_effects
+import pytensor
+pytensor.config.mode = "NUMBA"
+from pytensor import tensor as pt
+from pytensor.compile.function import function  # THIS imports the actual callable
 
-prescriptions_paths = [
-    "data/prescriptions_02_03_0501_2010-08_2025-08",
-]
-suffix = "_with_flags.nc"
+print("PyTensor mode:", pytensor.config.mode)  # should be 'NUMBA'
 
-for path in prescriptions_paths:
-    ds = xr.load_dataset(path + suffix)
-    print(ds.data_vars)
-
-
+# define simple function
+x = pt.dscalar("x")
+y = x ** 2
+f = function([x], y)
+print("f(5) =", f(5))

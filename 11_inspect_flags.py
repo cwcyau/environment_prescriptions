@@ -14,7 +14,7 @@ flag_types = [
     "met_tmax",
     "flood", 
     "aqrean_carbon_monoxide",
-    "aqrean_daqi",
+    "aqrean_daqi_overall",
     "aqrean_nitrogen_monoxide",
     "aqrean_nitrogen_dioxide",
     "aqrean_daqi_nitrogen_dioxide",
