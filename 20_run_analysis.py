@@ -9,6 +9,8 @@ min_practice_obs = 20  # practices with fewer points will be excluded
 n_jobs = 12  # number of parallel jobs to run
 seasonal_correction = True  # whether to include a seasonal correction term
 practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope
+standardise_values = True  # whether to standardise values variables (global)
+standardise_items = True  # whether to standardise items variable (per practice)
 
 # file paths to process
 prescriptions_paths = [
@@ -63,6 +65,7 @@ if __name__ == "__main__":
                                   save_folder,
                                   seasonal_correction=seasonal_correction,
                                   practice_correction=practice_correction,
+                                  standardise_items=standardise_items,
                                   min_practice_obs=min_practice_obs,
                                   n_jobs=n_jobs,)
 
@@ -74,8 +77,9 @@ if __name__ == "__main__":
                                    save_folder,
                                    seasonal_correction=seasonal_correction,
                                    practice_correction=practice_correction,
+                                   standardise_values=standardise_values,
+                                   standardise_items=standardise_items,
                                    min_practice_obs=min_practice_obs,
-                                   n_jobs=n_jobs,
-                                   standardise=True)
+                                   n_jobs=n_jobs)
 
     status("Script complete.")

@@ -1,14 +1,18 @@
 # import os
 # os.environ["PYTENSOR_FLAGS"] = "mode=NUMBA"  # for laptop runs
 
+import json
 import xarray as xr
+import arviz as az
 from funcs import run_bayesian_raw_model, status
 
 # parameters
 n_practices = None  # limit to n practices with most data points (4000 for testing on laptop, None for full analysis)
-practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope, 3 = intercept + slope + correlation
-min_obs_per_practice = 20  # practices with fewer points will be excluded
 seasonal_correction = True  # whether to include a seasonal correction term
+practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope, 3 = intercept + slope + correlation
+standardise_values = True  # whether to standardise values variables (global)
+standardise_items = True  # whether to standardise items variable (per practice)
+min_obs_per_practice = 20  # practices with fewer points will be excluded
 use_pca = False  # whether to use raw values (False) or PCA to reduce dimensionality of factors (True)
 draws = 3000  # number of MCMC draws
 tune = 3000  # number of tuning steps
@@ -85,6 +89,8 @@ if __name__ == "__main__":
             results_folder=save_folder,
             seasonal_correction=seasonal_correction,
             practice_correction=practice_correction,
+            standardise_values=standardise_values,
+            standardise_items=standardise_items,
             n_practices=n_practices,
             min_practice_obs=min_obs_per_practice,
             use_pca=use_pca,

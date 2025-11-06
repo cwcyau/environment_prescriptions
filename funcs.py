@@ -559,8 +559,9 @@ def run_all_flag_mixed_models(
     ds,
     flag_types: List[str],
     results_folder: str,
-    seasonal_correction: bool = True,
+    seasonal_correction: bool = False,
     practice_correction: int = 0,
+    standardise_items: bool = False,
     min_practice_obs: int = 20,
     n_jobs: int = 1,
 ):
@@ -583,6 +584,8 @@ def run_all_flag_mixed_models(
         0 = none,
         1 = random intercepts,
         2 = random intercepts + slopes.
+    standardise_items : bool
+        Whether to standardise 'items' (per practice) before modelling.
     min_practice_obs : int
         Practices excluded if they have fewer than this number of observations.
     n_jobs : int
@@ -678,7 +681,7 @@ def run_all_flag_mixed_models(
 
     # prepare a base dataframe (items + month + index) ============================================
     status("Preparing base dataframe from dataset...")
-    ds = prepare_ds(ds)
+    ds = prepare_ds(ds, standardise_items=standardise_items)
     df_items = ds["items"].to_dataframe().reset_index()
     df_items["date"] = pd.to_datetime(df_items["date"])
     df_items["month"] = df_items["date"].dt.month
@@ -798,17 +801,21 @@ def run_all_flag_mixed_models(
     # save results ================================================================================
     results_df = pd.DataFrame(results)
     os.makedirs(results_folder, exist_ok=True)
+    if standardise_items:
+        csv_path = os.path.join(results_folder, "mixed_effects_flag_results_standardised_items.csv")
+        txt_path = os.path.join(results_folder, "mixed_effects_flag_results_standardised_items.txt")
+    else:
+        csv_path = os.path.join(results_folder, "mixed_effects_flag_results.csv")
+        txt_path = os.path.join(results_folder, "mixed_effects_flag_results.txt")
     # save csv results
-    out_csv = os.path.join(results_folder, "mixed_effects_flag_results.csv")
-    results_df.to_csv(out_csv, index=False)
-    status(f"Results saved to {out_csv}")
+    results_df.to_csv(csv_path, index=False)
+    status(f"Results saved to {csv_path}")
     # save pretty results text
-    out_txt = os.path.join(results_folder, "mixed_effects_flag_results.txt")
     max_name_len = results_df["name"].str.len().max()
     max_coef_len = results_df["coef"].apply(lambda x: len(f"{x:.2f}")).max()
     max_ci_len = results_df[["ci_low", "ci_high"]].map(lambda x: len(f"{x:.2f}") if pd.notna(x) else 4).max().max()
     max_pval_len = results_df["pval"].apply(lambda x: len(f"{x:.3g}") if pd.notna(x) else 4).max()
-    with open(out_txt, "w") as f:
+    with open(txt_path, "w") as f:
         for row in results_df.itertuples():
             name_str = row.name.ljust(max_name_len)
             coef_str = f"{row.coef:.2f}".rjust(max_coef_len) if pd.notna(row.coef) else "NaN".rjust(max_coef_len)
@@ -816,6 +823,7 @@ def run_all_flag_mixed_models(
             pval_str = f"p = {row.pval:.3g}".rjust(max_pval_len+5) if pd.notna(row.pval) else "p = NaN".rjust(max_pval_len+5)
             error_str = f"** error: {row.error}" if pd.notna(row.error) and row.error != "" else ""
             f.write(f"{name_str}  {coef_str}  {ci_str}  {pval_str}  {error_str}\n")
+    status(f"Pretty results saved to {txt_path}")
 
     return results_df
 
@@ -823,11 +831,12 @@ def run_all_value_mixed_models(
     ds,
     value_vars: List[str],
     results_folder: str,
-    seasonal_correction: bool = True,
+    seasonal_correction: bool = False,
     practice_correction: int = 0,
+    standardise_values: bool = False,
+    standardise_items: bool = False,
     min_practice_obs: int = 20,
     n_jobs: int = 1,
-    standardise: bool = True,
 ):
     """
     Runs mixed-effects models comparing prescription 'items' using raw continuous measurements.
@@ -847,12 +856,14 @@ def run_all_value_mixed_models(
         0 = no practice correction,
         1 = random intercept per practice,
         2 = random intercept + slope on date_code per practice.
+    standardise_values : bool
+        Whether to standardise predictor values (globally) before modelling.
+    standardise_items : bool
+        Whether to standardise 'items' (per practice) before modelling.
     min_practice_obs : int
         Practices excluded if they have fewer than this number of observations.
     n_jobs : int
         Number of parallel jobs.
-    standardize : bool
-        Whether to standardize each predictor to mean=0, std=1.
     """
 
     def fit_mixed_effects(df: pd.DataFrame, formula: str, re_formula: str, group_var="practice_id") -> Dict:
@@ -871,7 +882,7 @@ def run_all_value_mixed_models(
         return out
 
     # prepare base dataframe
-    ds = prepare_ds(ds)
+    ds = prepare_ds(ds, standardise_values=standardise_values, standardise_items=standardise_items)
     df_items = ds[["items"]].to_dataframe().reset_index()
     df_items["date"] = pd.to_datetime(df_items["date"])
     df_items["month"] = df_items["date"].dt.month
@@ -901,10 +912,7 @@ def run_all_value_mixed_models(
         df_model = df_items[["items", "month"]].copy()
         df_model["date_code"] = df_model.index.get_level_values("date").map(ds["date_code"].to_series())
         df_model["practice_id"] = df_model.index.get_level_values("practice_id")
-        s_var = ds[var].to_dataframe()[var].reindex(df_index)
-        if standardise:
-            s_var = (s_var - s_var.mean()) / s_var.std()
-        df_model[var] = s_var
+        df_model[var] = ds[var].to_dataframe()[var].reindex(df_index)
 
         # filter to practices with at least min_practice_obs observations
         df_model_clean = df_model.dropna(subset=["items", var]).copy()
@@ -926,15 +934,21 @@ def run_all_value_mixed_models(
     status(f"Running mixed-effects models for {len(tasks)} variables (n_jobs={n_jobs})...")
     results = Parallel(n_jobs=n_jobs)(delayed(run_task)(var) for var in tqdm(tasks))
 
+    # configure save paths
+    if standardise_items:
+        out_csv = os.path.join(results_folder, "mixed_effects_values_results_standardised_items.csv")
+        out_txt = os.path.join(results_folder, "mixed_effects_values_results_standardised_items.txt")
+    else:
+        out_csv = os.path.join(results_folder, "mixed_effects_values_results.csv")
+        out_txt = os.path.join(results_folder, "mixed_effects_values_results.txt")
+
     # save results
     results_df = pd.DataFrame(results)
     os.makedirs(results_folder, exist_ok=True)
-    out_csv = os.path.join(results_folder, "mixed_effects_values_results.csv")
     results_df.to_csv(out_csv, index=False)
     status(f"Results saved to {out_csv}")
 
     # pretty text output
-    out_txt = os.path.join(results_folder, "mixed_effects_values_results.txt")
     max_name_len = results_df["name"].str.len().max()
     max_coef_len = results_df["coef"].apply(lambda x: len(f"{x:.2f}") if pd.notna(x) else 4).max()
     max_ci_len = results_df[["ci_low","ci_high"]].map(lambda x: len(f"{x:.2f}") if pd.notna(x) else 4).max().max()
@@ -947,6 +961,7 @@ def run_all_value_mixed_models(
             pval_str = f"p = {row.pval:.3g}".rjust(max_pval_len+5) if pd.notna(row.pval) else "p = NaN".rjust(max_pval_len+5)
             error_str = f"** error: {row.error}" if pd.notna(row.error) and row.error != "" else ""
             f.write(f"{name_str}  {coef_str}  {ci_str}  {pval_str}  {error_str}\n")
+    status(f"Pretty results saved to {out_txt}")
 
     return results_df
 
@@ -958,6 +973,8 @@ def run_bayesian_raw_model(
     n_components: int = None,
     seasonal_correction: bool = True,
     practice_correction: int = 1,
+    standardise_values: bool = False,
+    standardise_items: bool = False,
     n_practices: int = None,
     min_practice_obs: int = 20,
     interactions: list = None,
@@ -985,9 +1002,19 @@ def run_bayesian_raw_model(
     seasonal_correction : bool
         Whether to include month-of-year as categorical covariate.
     practice_correction : int
-        Level of practice-specific random effects: 0 = none, 1 = intercept only, 2 = intercept + slope, 3 = intercept + slope + correlation.
-    practice_n : int or None
+        Level of practice-specific random effects:
+        0 = none
+        1 = intercept only
+        2 = intercept + slope
+        3 = intercept + slope + correlation.
+    standardise_values : bool
+        Whether to standardise predictor values (globally) before modelling.
+    standardise_items : bool
+        Whether to standardise 'items' (per practice) before modelling.
+    n_practices : int or None
         If specified, limit practices to this many with the most items (for testing).
+    min_practice_obs : int
+        Practices excluded if they have fewer than this number of observations.
     interactions : list of str
         Interactions to include, specified as "base1 x base2". Bases matched to variable names.
     poly_terms : dict
@@ -1002,15 +1029,14 @@ def run_bayesian_raw_model(
     idata : arviz.InferenceData
         Posterior draws.
     """
-    # system configuration
+    # check output folder
     os.makedirs(results_folder, exist_ok=True)
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger("pymc")
-    logger.setLevel(logging.INFO)
 
     # dataset configuration
     status("Preparing dataset for Bayesian modeling...")
-    ds = prepare_ds(ds, n_practices=n_practices)
+    ds = prepare_ds(ds, n_practices=n_practices,
+                    standardise_values=standardise_values,
+                    standardise_items=standardise_items)
 
     # prepare dataframe
     status("Preparing dataframe for model input...")
@@ -1087,11 +1113,11 @@ def run_bayesian_raw_model(
     if seasonal_correction:
         formula += " + C(month)"
     if practice_correction == 1:
-        formula += " + (1|practice_id)"
+        formula += " + (1 | practice_id)"  # intercept
     elif practice_correction == 2:
-        formula += " + (1 + date_code||practice_id)"
+        formula += " + (1 | practice_id) + (0 + date_code | practice_id)"  # intercept + slope, uncorrelated
     elif practice_correction == 3:
-        formula += " + (1 + date_code|practice_id)"
+        formula += " + (date_code | practice_id)"  # intercept + slope, correlated
     elif practice_correction != 0:
         raise ValueError("practice_correction must be 0, 1, 2, or 3")
 
@@ -1109,23 +1135,24 @@ def run_bayesian_raw_model(
         status(f"Using {len(valid_practices)} practices with >= {min_practice_obs} observations.")
 
     # fit Bayesian model
-    status("Fitting hierarchical Bayesian model with Bambi...")
+    status(f"Fitting Bambi model with formula '{formula}'...")
     model = bmb.Model(formula, df)
-    progress_callback = make_progress_callback(draws, tune)
+    # progress_callback = make_progress_callback(draws, tune)
     idata = model.fit(draws=draws,
                       tune=tune,
                       chains=chains,
-                      cores=cores,
-                      progressbar=False,
-                      callbacks=[progress_callback])
+                      cores=cores,)
+                    #   progressbar=False,
+                    #   callback=[progress_callback])
 
     # save summary
     summary_df = az.summary(idata)
-    summary_csv = os.path.join(results_folder, "bayesian_raw_model_summary.csv")
+    summary_csv = os.path.join(results_folder, "bayesian_model_summary.csv")
     summary_df.to_csv(summary_csv)
+    status(f"Posterior summary saved to: {summary_csv}")
 
     # prettier text summary
-    out_txt = os.path.join(results_folder, "bayesian_raw_model_summary.txt")
+    out_txt = os.path.join(results_folder, "bayesian_model_summary.txt")
     max_name_len = summary_df.index.str.len().max()
     with open(out_txt, "w") as f:
         for var, row in summary_df.iterrows():
@@ -1133,20 +1160,62 @@ def run_bayesian_raw_model(
             hdi_3pc = row['hdi_3%']
             hdi_97pc = row['hdi_97%']
             f.write(f"{var.ljust(max_name_len)} : {mean:8.2f} (CI: {hdi_3pc:8.2f}, {hdi_97pc:8.2f})\n")
+    status(f"Text summary saved to: {out_txt}")
 
-    status(f"Posterior summary saved to:\n{summary_csv}\n{out_txt}")
+    # save the model
+    idata_path = os.path.join(results_folder, "bayesian_model_idata.nc")
+    az.to_netcdf(idata, idata_path)
+    status(f"Model results saved to: {idata_path}")
+    spec_path = os.path.join(results_folder, "bayesian_model_spec.json")
+    spec = {
+        "formula": model.formula,
+        "family": str(model.family),
+        "priors": {k: str(v) for k, v in model.priors.items()},
+    }
+    with open(spec_path, "w") as f:
+        json.dump(spec, f, indent=2)
+    status(f"Model specification saved to: {spec_path}")
+
     return model, idata
 
 # ANALYSIS HELPERS ================================================================================
-def prepare_ds(ds, n_practices=None):
-    """Prepare dataset for analysis by filtering practices with insufficient data."""
+def prepare_ds(ds, n_practices=None, standardise_values=False, standardise_items=False):
+    """
+    Prepare dataset for analysis by adding date_code, limiting practices and
+    standardising variables/items, as requested.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Input dataset with 'date' and 'practice_id' dimensions.
+    n_practices : int or None
+        If specified, limit to this many practices with most items.
+    standardise_values : bool
+        Whether to standardise all variables globally (except items, quantity, actual_cost).
+    standardise_items : bool
+        Whether to standardise 'items' per practice.
+    """
     ds["date_code"] = ("date", np.arange(len(ds["date"])))  # integer months since start
     ds["date_code"] = (ds["date_code"] - ds["date_code"].mean()) / ds["date_code"].std()  # standardised
     if n_practices is not None:
-        practice_counts = ds["items"].sum(dim="date").sortby(ds["items"].sum(dim="date"), ascending=False)
+        practice_counts = ds["items"].sum(dim="date").sortby(ds["items"].sum(dim="date"),
+                                                             ascending=False)
         top_practices = practice_counts["practice_id"].values[:n_practices]
         status(f"Limiting to top {n_practices} practices with most items")
         ds = ds.sel(practice_id=top_practices)
+    if standardise_values:
+        status("Standardising predictor values globally")
+        for var in ds.data_vars:
+            if var not in ["items", "quantity", "actual_cost",
+                           "date", "date_code", "practice_id"]:
+                mean = ds[var].mean().item()
+                std = ds[var].std().item() + 1e-8  # prevent div by zero
+                ds[var] = (ds[var] - mean) / std
+    if standardise_items:
+        status("Standardising 'items' per practice")
+        mean = ds["items"].mean(dim="date")
+        std = ds["items"].std(dim="date") + 1e-8  # prevent div by zero
+        ds["items"] = (ds["items"] - mean) / std
     return ds
 
 def make_progress_callback(total_draws, total_tune):
@@ -1155,6 +1224,7 @@ def make_progress_callback(total_draws, total_tune):
         if pct % 10 == 0:
             print(f"Chain {chain}, {pct}% complete", flush=True)
     return progress_callback
+
 
 # GENERAL HELPERS =================================================================================
 def status(*message):
