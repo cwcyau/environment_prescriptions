@@ -1,0 +1,16 @@
+hydro_rain_values                                -4.23  (CI: -5.44, -3.01)      p = 1e-11  
+met_rain_values                                  -5.29  (CI: -6.65, -3.94)   p = 1.71e-14  
+met_tmax_values                                   7.70  (CI: 6.31, 9.09)   p = 1.73e-27  
+aqrean_carbon_monoxide_values                     5.02  (CI: 3.76, 6.29)   p = 6.61e-15  
+aqrean_daqi_overall_values                       -4.21  (CI: -5.49, -2.93)   p = 1.29e-10  
+aqrean_nitrogen_monoxide_values                  -2.49  (CI: -3.75, -1.22)   p = 0.000116  
+aqrean_nitrogen_dioxide_values                    4.17  (CI: 2.85, 5.48)   p = 5.95e-10  
+aqrean_daqi_nitrogen_dioxide_values              -5.03  (CI: -6.35, -3.71)   p = 7.67e-14  
+aqrean_nox_expressed_as_nitrogen_dioxide_values  -2.09  (CI: -3.37, -0.82)    p = 0.00124  
+aqrean_ozone_values                               2.39  (CI: 1.10, 3.68)    p = 0.00029  
+aqrean_daqi_ozone_values                          1.90  (CI: 0.60, 3.20)     p = 0.0042  
+aqrean_pm2p5_values                               0.70  (CI: -0.59, 1.98)      p = 0.287  
+aqrean_pm10_values                                3.84  (CI: 2.57, 5.12)   p = 3.64e-09  
+aqrean_daqi_pm10_values                          -7.05  (CI: -8.36, -5.73)   p = 6.39e-26  
+aqrean_sulfur_dioxide_values                     -0.42  (CI: -1.81, 0.97)      p = 0.556  
+aqrean_daqi_sulfur_dioxide_values                -0.10  (CI: -1.35, 1.15)      p = 0.876  

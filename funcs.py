@@ -1,11 +1,10 @@
-import os, json, requests, re, logging, sys
+import os, json, requests, re
 import numpy as np
 import pandas as pd
 import bambi as bmb
 import arviz as az
 import statsmodels.formula.api as smf
 import matplotlib.pyplot as plt
-import pymc as pm
 from datetime import datetime
 from pyproj import Transformer
 from tqdm import tqdm
@@ -23,7 +22,8 @@ MIN_GROUP_N = 5  # minimum number of flags against practice for analysis
 # DATA FUNCTIONS ==================================================================================
 def add_hydrology_flags(prescriptions_ds, hydrology_ds,
                         observed_property="rain", agg="sum",
-                        flag_types=["high", "low", "median"]):
+                        flag_types=["high", "low", "median"],
+                        seasonal_correction=False):
     """
     Add flags to the prescriptions dataset based on hydrology station data.
 
@@ -32,6 +32,7 @@ def add_hydrology_flags(prescriptions_ds, hydrology_ds,
     observed_property: str, the property to observe (e.g. "rain")
     agg: str, the aggregation method to use (e.g. "sum")
     flag_types: list of str, the types of flags to create (e.g. ["high", "low", "median"])
+    seasonal_correction: bool, whether to apply seasonal correction
     """
     # get practice and station locations
     lat_p = prescriptions_ds.latitude.values
@@ -72,8 +73,11 @@ def add_hydrology_flags(prescriptions_ds, hydrology_ds,
         monthly_rain_months = pd.to_datetime(monthly_rain_datetimes).to_period("M")
 
         # remove seasonal effects from readings
-        monthly_z_values = remove_seasonal_effects(monthly_rain_datetimes,
-                                                   monthly_rain_readings)
+        if seasonal_correction:
+            monthly_z_values = remove_seasonal_effects(monthly_rain_datetimes,
+                                                       monthly_rain_readings)
+        else:
+            monthly_z_values = standardise_mad(monthly_rain_readings)
 
         # generate flags
         mask = nearest_stations == station_id
@@ -160,7 +164,8 @@ def add_geojson_flood_flags(prescriptions_ds, geojson_features,
 
 def add_met_flags(prescriptions_ds, met_ds,
                   observed_properties=["tmax", "rain"],
-                  flag_types=["high", "low", "median"]):
+                  flag_types=["high", "low", "median"],
+                  seasonal_correction=False):
     """
     Add flags to the prescriptions dataset based on MET Office station data.
 
@@ -169,6 +174,7 @@ def add_met_flags(prescriptions_ds, met_ds,
     observed_property: str, the property to observe (e.g. "rain")
     agg: str, the aggregation method to use (e.g. "sum")
     flag_types: list of str, the types of flags to create (e.g. ["high", "low", "median"])
+    seasonal_correction: bool, whether to apply seasonal correction
     """
     # get practice and station locations
     lat_p = prescriptions_ds.latitude.values
@@ -201,7 +207,10 @@ def add_met_flags(prescriptions_ds, met_ds,
             met_months = met_datetimes.to_period("M")
 
             # remove seasonal effects from readings
-            z_values = remove_seasonal_effects(met_datetimes, values)
+            if seasonal_correction:
+                z_values = remove_seasonal_effects(met_datetimes, values)
+            else:
+                z_values = standardise_mad(values)
 
             # generate flags
             nc_months = pres_datetimes.to_period("M")
@@ -223,7 +232,7 @@ def add_met_flags(prescriptions_ds, met_ds,
                                                                 outputs["values"])
     return prescriptions_ds
 
-def add_particulate_flags(prescriptions_ds, particulates_ds, mass_z_thresh=1.5):
+def add_particulate_flags(prescriptions_ds, particulates_ds, mass_z_thresh=1.5, seasonal_correction=False):
     # align particulates ds to prescriptions ds
     particulates_ds = particulates_ds.reindex(date=prescriptions_ds.date,
                                               practice_id=prescriptions_ds.practice_id,
@@ -240,9 +249,10 @@ def add_particulate_flags(prescriptions_ds, particulates_ds, mass_z_thresh=1.5):
 
         # convert mass concentration to z-scores and configure flags
         if not is_daqi:
-            medians = np.nanmedian(values, axis=0, keepdims=True)
-            mads = np.nanmedian(np.abs(values - medians), axis=0, keepdims=True) * 1.4826
-            vals_to_flag = (values - medians) / mads
+            if seasonal_correction:
+                vals_to_flag = remove_seasonal_effects(particulates_ds.date.values, values)
+            else:
+                vals_to_flag = standardise_mad(values)
             thresholds = {"high": (mass_z_thresh, None)}
             flag_types = ["high"]
         # otherwise use unprocessed DAQI monthly maximums and standard DAQI thresholds
@@ -344,22 +354,36 @@ def generate_flags(z_months, z_values, flag_type, target_months, z_thresh=1.0):
 def remove_seasonal_effects(datetimes, values):
     datetimes = pd.to_datetime(datetimes)
     month_nums = datetimes.month
-    medians = np.full(12, np.nan)
-    mads = np.full(12, np.nan)
+    m = month_nums - 1  # 0-based months (0..11)
 
-    for m in range(1, 13):
-        mask = (month_nums == m)
+    # ensure 2D shape for uniform processing
+    values_2d = np.atleast_2d(values)
+    if values_2d.shape[0] == 1 and len(datetimes) > 1:
+        # transpose if accidentally shaped (station_id, date)
+        values_2d = values_2d.T
+
+    n_date, n_stations = values_2d.shape
+    medians = np.full((12, n_stations), np.nan)
+    mads = np.full((12, n_stations), np.nan)
+
+    # compute monthly median and median absolute difference per column
+    for month in range(1, 13):
+        mask = month_nums == month
         if not np.any(mask):
             continue
-        v = values[mask]
-        med = np.nanmedian(v)
-        medians[m - 1] = med
-        mads[m - 1] = np.nanmedian(np.abs(v - med)) * 1.4826
+        v_month = values_2d[mask, :]
+        med = np.nanmedian(v_month, axis=0)
+        mad = np.nanmedian(np.abs(v_month - med), axis=0) * 1.4826
+        medians[month - 1, :] = med
+        mads[month - 1, :] = mad
 
-    # Vectorized z-score calculation
-    m = month_nums - 1
-    monthly_anomalies = (values - medians[m]) / (mads[m] + 1e-9)
-    return monthly_anomalies
+    # calculate monthly anomalies
+    anomalies = (values_2d - medians[m, :]) / (mads[m, :] + 1e-9)
+
+    # revert shape
+    if values.ndim == 1:
+        return anomalies[:, 0]
+    return anomalies
 
 def aggregate_monthly(datetimes, values, method):
     datetimes = pd.to_datetime(datetimes)
@@ -559,7 +583,7 @@ def run_all_flag_mixed_models(
     ds,
     flag_types: List[str],
     results_folder: str,
-    seasonal_correction: bool = False,
+    seasonal_correction_out: bool = False,
     practice_correction: int = 0,
     standardise_items: bool = False,
     min_practice_obs: int = 20,
@@ -577,7 +601,7 @@ def run_all_flag_mixed_models(
         The function will look for derived variable names (e.g. hydro_rain_high, hydro_rain_median, ...).
     results_folder : str
         Folder path for saving results.
-    seasonal_correction : bool
+    seasonal_correction_out : bool
         Whether to add month-of-year fixed effects: " + C(month)".
     practice_correction : int
         Whether to add practice-level fixed effects:
@@ -774,7 +798,7 @@ def run_all_flag_mixed_models(
                         error=f"No practices with >= {min_practice_obs} observations")
 
         # add month if seasonal correction requested
-        if seasonal_correction:
+        if seasonal_correction_out:
             formula = "items ~ flag_binary + C(month)"
         else:
             formula = "items ~ flag_binary"
@@ -801,12 +825,8 @@ def run_all_flag_mixed_models(
     # save results ================================================================================
     results_df = pd.DataFrame(results)
     os.makedirs(results_folder, exist_ok=True)
-    if standardise_items:
-        csv_path = os.path.join(results_folder, "mixed_effects_flag_results_standardised_items.csv")
-        txt_path = os.path.join(results_folder, "mixed_effects_flag_results_standardised_items.txt")
-    else:
-        csv_path = os.path.join(results_folder, "mixed_effects_flag_results.csv")
-        txt_path = os.path.join(results_folder, "mixed_effects_flag_results.txt")
+    csv_path = os.path.join(results_folder, "mixed_effects_flag_results.csv")
+    txt_path = os.path.join(results_folder, "mixed_effects_flag_results.txt")
     # save csv results
     results_df.to_csv(csv_path, index=False)
     status(f"Results saved to {csv_path}")
@@ -831,7 +851,8 @@ def run_all_value_mixed_models(
     ds,
     value_vars: List[str],
     results_folder: str,
-    seasonal_correction: bool = False,
+    seasonal_correction_out: bool = False,
+    seasonal_correction_in: bool = False,
     practice_correction: int = 0,
     standardise_values: bool = False,
     standardise_items: bool = False,
@@ -849,8 +870,10 @@ def run_all_value_mixed_models(
         Names of variables to test as predictors, e.g. ["hydro_rain", "met_tmax", "aqrean_pm10"].
     results_folder : str
         Folder path for saving results.
-    seasonal_correction : bool
-        Whether to add month-of-year fixed effects.
+    seasonal_correction_out : bool
+        Whether to add month-of-year fixed effects to the predicted variable.
+    seasonal_correction_in : bool
+        Whether to preform month of year correction on predictor variables.
     practice_correction : int
         Level of practice-level random effects correction:
         0 = no practice correction,
@@ -882,7 +905,9 @@ def run_all_value_mixed_models(
         return out
 
     # prepare base dataframe
-    ds = prepare_ds(ds, standardise_values=standardise_values, standardise_items=standardise_items)
+    ds = prepare_ds(ds, standardise_values=standardise_values,
+                    standardise_items=standardise_items,
+                    seasonal_correction=seasonal_correction_in)
     df_items = ds[["items"]].to_dataframe().reset_index()
     df_items["date"] = pd.to_datetime(df_items["date"])
     df_items["month"] = df_items["date"].dt.month
@@ -925,7 +950,7 @@ def run_all_value_mixed_models(
                         error=f"No practices with >= {min_practice_obs} observations")
         
         # fit model
-        formula = f"items ~ {var}" + (" + C(month)" if seasonal_correction else "")
+        formula = f"items ~ {var}" + (" + C(month)" if seasonal_correction_out else "")
         res = fit_mixed_effects(df_model_clean, formula, re_formula=re_formula)
         res["name"] = var
         return res
@@ -935,12 +960,8 @@ def run_all_value_mixed_models(
     results = Parallel(n_jobs=n_jobs)(delayed(run_task)(var) for var in tqdm(tasks))
 
     # configure save paths
-    if standardise_items:
-        out_csv = os.path.join(results_folder, "mixed_effects_values_results_standardised_items.csv")
-        out_txt = os.path.join(results_folder, "mixed_effects_values_results_standardised_items.txt")
-    else:
-        out_csv = os.path.join(results_folder, "mixed_effects_values_results.csv")
-        out_txt = os.path.join(results_folder, "mixed_effects_values_results.txt")
+    out_csv = os.path.join(results_folder, "mixed_effects_values_results.csv")
+    out_txt = os.path.join(results_folder, "mixed_effects_values_results.txt")
 
     # save results
     results_df = pd.DataFrame(results)
@@ -971,7 +992,8 @@ def run_bayesian_raw_model(
     results_folder: str,
     use_pca: bool = False,
     n_components: int = None,
-    seasonal_correction: bool = True,
+    seasonal_correction_out: bool = True,
+    seasonal_correction_in: bool = False,
     practice_correction: int = 1,
     standardise_values: bool = False,
     standardise_items: bool = False,
@@ -999,8 +1021,10 @@ def run_bayesian_raw_model(
         If True, apply PCA to predictors and use PCs as covariates.
     n_components : int or None
         Number of PCA components; if None, keep all.
-    seasonal_correction : bool
-        Whether to include month-of-year as categorical covariate.
+    seasonal_correction_out : bool
+        Whether to include month-of-year seasonal correction terms for the output variable.
+    seasonal_correction_in : bool
+        Whether to apply month-of-year seasonal correction to the predictor variables.
     practice_correction : int
         Level of practice-specific random effects:
         0 = none
@@ -1016,7 +1040,7 @@ def run_bayesian_raw_model(
     min_practice_obs : int
         Practices excluded if they have fewer than this number of observations.
     interactions : list of str
-        Interactions to include, specified as "base1 x base2". Bases matched to variable names.
+        Interactions to include, specified as "variable1 x variable2".
     poly_terms : dict
         Dictionary of {var_name: max_power} to create polynomial terms.
     draws, tune, chains : int
@@ -1036,7 +1060,8 @@ def run_bayesian_raw_model(
     status("Preparing dataset for Bayesian modeling...")
     ds = prepare_ds(ds, n_practices=n_practices,
                     standardise_values=standardise_values,
-                    standardise_items=standardise_items)
+                    standardise_items=standardise_items,
+                    seasonal_correction=seasonal_correction_in)
 
     # prepare dataframe
     status("Preparing dataframe for model input...")
@@ -1072,45 +1097,21 @@ def run_bayesian_raw_model(
                 poly_predictors.append(col_name)
         predictors += poly_predictors
 
-    # build interaction terms
+    # interaction terms
     interaction_terms = []
     if interactions and not use_pca:
         status("Adding interaction terms...")
         for inter in interactions:
-            lhs, rhs = [b.strip() for b in inter.split(" x ")]
-
-            # match raw_vars with wildcard support
-            def match_pattern(pattern):
-                pat = pattern.replace("*", ".*")  # convert shell * to regex
-                regex = re.compile(f"^{pat}_values$")
-                return [v for v in raw_vars if regex.match(v)]
-            lhs_vars = match_pattern(lhs)
-            rhs_vars = match_pattern(rhs)
-
-            # raise error if no matches
-            if not lhs_vars or not rhs_vars:
-                raise ValueError(
-                    f"Interaction '{inter}' produced no matches.\n"
-                    f"  LHS matched: {lhs_vars}\n"
-                    f"  RHS matched: {rhs_vars}\n"
-                    f"  Check interaction pattern or raw_vars list."
-                )
-
-            # build all pairwise terms, excluding self-self
-            for a in lhs_vars:
-                for b in rhs_vars:
-                    if a != b:  # prevent self x self
-                        term = f"{a}*{b}"
-                        alt_term = f"{b}*{a}"
-                        if term not in interaction_terms and alt_term not in interaction_terms:  # avoid duplicates
-                            interaction_terms.append(term)
-
-        # finally add them to predictors
+            inter = inter.strip().replace(" ", "")
+            if "*" in inter:
+                interaction_terms.append(inter)
+            else:
+                raise ValueError(f"Interaction '{inter}' must be specified using '*' between variable names.")
         predictors += interaction_terms
 
     # build formula
     formula = "items ~ " + " + ".join(predictors)
-    if seasonal_correction:
+    if seasonal_correction_out:
         formula += " + C(month)"
     if practice_correction == 1:
         formula += " + (1 | practice_id)"  # intercept
@@ -1166,20 +1167,11 @@ def run_bayesian_raw_model(
     idata_path = os.path.join(results_folder, "bayesian_model_idata.nc")
     az.to_netcdf(idata, idata_path)
     status(f"Model results saved to: {idata_path}")
-    spec_path = os.path.join(results_folder, "bayesian_model_spec.json")
-    spec = {
-        "formula": model.formula,
-        "family": str(model.family),
-        "priors": {k: str(v) for k, v in model.priors.items()},
-    }
-    with open(spec_path, "w") as f:
-        json.dump(spec, f, indent=2)
-    status(f"Model specification saved to: {spec_path}")
 
     return model, idata
 
 # ANALYSIS HELPERS ================================================================================
-def prepare_ds(ds, n_practices=None, standardise_values=False, standardise_items=False):
+def prepare_ds(ds, n_practices=None, standardise_values=False, standardise_items=False, seasonal_correction=False):
     """
     Prepare dataset for analysis by adding date_code, limiting practices and
     standardising variables/items, as requested.
@@ -1194,6 +1186,8 @@ def prepare_ds(ds, n_practices=None, standardise_values=False, standardise_items
         Whether to standardise all variables globally (except items, quantity, actual_cost).
     standardise_items : bool
         Whether to standardise 'items' per practice.
+    seasonal_correction : bool
+        Whether to do seasonal correction on predictors.
     """
     ds["date_code"] = ("date", np.arange(len(ds["date"])))  # integer months since start
     ds["date_code"] = (ds["date_code"] - ds["date_code"].mean()) / ds["date_code"].std()  # standardised
@@ -1203,6 +1197,14 @@ def prepare_ds(ds, n_practices=None, standardise_values=False, standardise_items
         top_practices = practice_counts["practice_id"].values[:n_practices]
         status(f"Limiting to top {n_practices} practices with most items")
         ds = ds.sel(practice_id=top_practices)
+    if seasonal_correction:
+        status("Applying seasonal correction to predictor variables")
+        for var in ds.data_vars:
+            if var not in ["items", "quantity", "actual_cost",
+                           "date", "date_code", "practice_id"]:
+                monthly_means = ds[var].groupby("date.month").mean(dim="date")
+                monthly_means_expanded = monthly_means.sel(month=ds["date.month"])
+                ds[var] = ds[var] - monthly_means_expanded
     if standardise_values:
         status("Standardising predictor values globally")
         for var in ds.data_vars:
@@ -1233,7 +1235,11 @@ def status(*message):
     message = " ".join([str(m) for m in message])
     print(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f:"), message, flush=True)
 
-
+def standardise_mad(values):
+    """Compute Median Absolute Deviation of a 2D array with dimensions (date, practice_id)."""
+    median = np.nanmedian(values, axis=0, keepdims=True)
+    mad = np.nanmedian(np.abs(values - median), axis=0, keepdims=True)
+    return (values - median) / (mad * 1.4826 + 1e-8)
 
 
 
@@ -1468,3 +1474,23 @@ def aggregate_monthly_old2(datetimes, values, method):
     monthly_vals = np.array([func(values[i0:i1]) for i0, i1 in zip(idx_start, idx_end)])
     months = [pd.Timestamp(year=int(k // 12), month=int(k % 12 or 12), day=1) for k in unique_keys]
     return np.array(months), monthly_vals
+
+def remove_seasonal_effects_old(datetimes, values):
+    datetimes = pd.to_datetime(datetimes)
+    month_nums = datetimes.month
+    medians = np.full(12, np.nan)
+    mads = np.full(12, np.nan)
+
+    for m in range(1, 13):
+        mask = (month_nums == m)
+        if not np.any(mask):
+            continue
+        v = values[mask]
+        med = np.nanmedian(v)
+        medians[m - 1] = med
+        mads[m - 1] = np.nanmedian(np.abs(v - med)) * 1.4826
+
+    # Vectorized z-score calculation
+    m = month_nums - 1
+    monthly_anomalies = (values - medians[m]) / (mads[m] + 1e-9)
+    return monthly_anomalies
