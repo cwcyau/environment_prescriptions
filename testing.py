@@ -13,3 +13,13 @@ for path in prescriptions_paths:
     print(f"Comparing datasets for {path}:")
     print(ds1)
     print(ds2)
+
+
+
+# finish download
+# rm -r pres/outputs/
+# qsend_mixed
+# qsend_bayes 02
+# qsend_bayes 03
+# qsend_bayes 0501
+# qsend_bayes 02_03_0501

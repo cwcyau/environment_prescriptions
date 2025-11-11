@@ -17,8 +17,6 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 
-MIN_GROUP_N = 5  # minimum number of flags against practice for analysis
-
 # DATA FUNCTIONS ==================================================================================
 def add_hydrology_flags(prescriptions_ds, hydrology_ds,
                         observed_property="rain", agg="sum",
@@ -298,7 +296,7 @@ def add_particulate_flags(prescriptions_ds, particulates_ds, mass_z_thresh=1.5, 
 
     return prescriptions_ds
 
-# DATA HELPERS ====================================================================================
+# DATA HELPERS ------------------------------------------------------------------------------------
 def download_file(url, session, out_dir='', timeout=20, overwrite=False):
     """Download file streaming to disk. Skip if already exists."""
     fname = url.split("/")[-1]
@@ -396,8 +394,7 @@ def aggregate_monthly(datetimes, values, method):
         monthly = df.resample('MS').agg(method)
     return monthly.index.values, monthly['value'].values
 
-
-# INSPECTION FUNCTIONS ============================================================================
+# INSPECTION FUNCTIONS ----------------------------------------------------------------------------
 def plot_practices(ds, nc_file_path, flag_types, sample_size=30, seed=None):
     """
     Plot prescriptions for a sample of practices.
@@ -578,14 +575,14 @@ def plot_readings(ax, practice_data, flag_vars, seasonal_correction=False):
     return ax
 
 
-# ANALYSIS FUNCTIONS ==============================================================================
+
+# MODELING FUNCTIONS ==============================================================================
 def run_all_flag_mixed_models(
     ds,
     flag_types: List[str],
     results_folder: str,
-    seasonal_correction_out: bool = False,
+    deseasonalise_output: bool = False,
     practice_correction: int = 0,
-    standardise_items: bool = False,
     min_practice_obs: int = 20,
     n_jobs: int = 1,
 ):
@@ -705,7 +702,6 @@ def run_all_flag_mixed_models(
 
     # prepare a base dataframe (items + month + index) ============================================
     status("Preparing base dataframe from dataset...")
-    ds = prepare_ds(ds, standardise_items=standardise_items)
     df_items = ds["items"].to_dataframe().reset_index()
     df_items["date"] = pd.to_datetime(df_items["date"])
     df_items["month"] = df_items["date"].dt.month
@@ -798,7 +794,7 @@ def run_all_flag_mixed_models(
                         error=f"No practices with >= {min_practice_obs} observations")
 
         # add month if seasonal correction requested
-        if seasonal_correction_out:
+        if deseasonalise_output:
             formula = "items ~ flag_binary + C(month)"
         else:
             formula = "items ~ flag_binary"
@@ -851,11 +847,8 @@ def run_all_value_mixed_models(
     ds,
     value_vars: List[str],
     results_folder: str,
-    seasonal_correction_out: bool = False,
-    seasonal_correction_in: bool = False,
+    deseasonalise_output: bool = False,
     practice_correction: int = 0,
-    standardise_values: bool = False,
-    standardise_items: bool = False,
     min_practice_obs: int = 20,
     n_jobs: int = 1,
 ):
@@ -905,9 +898,6 @@ def run_all_value_mixed_models(
         return out
 
     # prepare base dataframe
-    ds = prepare_ds(ds, standardise_values=standardise_values,
-                    standardise_items=standardise_items,
-                    seasonal_correction=seasonal_correction_in)
     df_items = ds[["items"]].to_dataframe().reset_index()
     df_items["date"] = pd.to_datetime(df_items["date"])
     df_items["month"] = df_items["date"].dt.month
@@ -950,7 +940,7 @@ def run_all_value_mixed_models(
                         error=f"No practices with >= {min_practice_obs} observations")
         
         # fit model
-        formula = f"items ~ {var}" + (" + C(month)" if seasonal_correction_out else "")
+        formula = f"items ~ {var}" + (" + C(month)" if deseasonalise_output else "")
         res = fit_mixed_effects(df_model_clean, formula, re_formula=re_formula)
         res["name"] = var
         return res
@@ -986,18 +976,15 @@ def run_all_value_mixed_models(
 
     return results_df
 
-def run_bayesian_raw_model(
+def run_bayesian_model(
     ds,
     raw_vars: list,
     results_folder: str,
+    file_suffix: str = "",
     use_pca: bool = False,
     n_components: int = None,
-    seasonal_correction_out: bool = True,
-    seasonal_correction_in: bool = False,
+    deseasonalise_output: bool = True,
     practice_correction: int = 1,
-    standardise_values: bool = False,
-    standardise_items: bool = False,
-    n_practices: int = None,
     min_practice_obs: int = 20,
     interactions: list = None,
     poly_terms: dict = None,
@@ -1031,8 +1018,13 @@ def run_bayesian_raw_model(
         1 = intercept only
         2 = intercept + slope
         3 = intercept + slope + correlation.
-    standardise_values : bool
-        Whether to standardise predictor values (globally) before modelling.
+    adjust_inputs : str or None
+        Method to adjust predictor inputs before modelling. Options include:
+        'z-global': standardise values globally
+        'z-practice': standardise per practice
+        'c-global': centre globally
+        'c-practice': centre per practice
+        None: raw values
     standardise_items : bool
         Whether to standardise 'items' (per practice) before modelling.
     n_practices : int or None
@@ -1055,13 +1047,6 @@ def run_bayesian_raw_model(
     """
     # check output folder
     os.makedirs(results_folder, exist_ok=True)
-
-    # dataset configuration
-    status("Preparing dataset for Bayesian modeling...")
-    ds = prepare_ds(ds, n_practices=n_practices,
-                    standardise_values=standardise_values,
-                    standardise_items=standardise_items,
-                    seasonal_correction=seasonal_correction_in)
 
     # prepare dataframe
     status("Preparing dataframe for model input...")
@@ -1111,7 +1096,7 @@ def run_bayesian_raw_model(
 
     # build formula
     formula = "items ~ " + " + ".join(predictors)
-    if seasonal_correction_out:
+    if deseasonalise_output:
         formula += " + C(month)"
     if practice_correction == 1:
         formula += " + (1 | practice_id)"  # intercept
@@ -1148,12 +1133,12 @@ def run_bayesian_raw_model(
 
     # save summary
     summary_df = az.summary(idata)
-    summary_csv = os.path.join(results_folder, "bayesian_model_summary.csv")
+    summary_csv = os.path.join(results_folder, f"bayesian_model_summary{file_suffix}.csv")
     summary_df.to_csv(summary_csv)
     status(f"Posterior summary saved to: {summary_csv}")
 
     # prettier text summary
-    out_txt = os.path.join(results_folder, "bayesian_model_summary.txt")
+    out_txt = os.path.join(results_folder, f"bayesian_model_summary{file_suffix}.txt")
     max_name_len = summary_df.index.str.len().max()
     with open(out_txt, "w") as f:
         for var, row in summary_df.iterrows():
@@ -1164,14 +1149,14 @@ def run_bayesian_raw_model(
     status(f"Text summary saved to: {out_txt}")
 
     # save the model
-    idata_path = os.path.join(results_folder, "bayesian_model_idata.nc")
+    idata_path = os.path.join(results_folder, f"bayesian_model_idata{file_suffix}.nc")
     az.to_netcdf(idata, idata_path)
     status(f"Model results saved to: {idata_path}")
 
     return model, idata
 
-# ANALYSIS HELPERS ================================================================================
-def prepare_ds(ds, n_practices=None, standardise_values=False, standardise_items=False, seasonal_correction=False):
+# MODELING HELPERS --------------------------------------------------------------------------------
+def prepare_ds(ds, n_practices=None, standardise_items=False, adjust_predictors=None, deseasonalise_predictors=False):
     """
     Prepare dataset for analysis by adding date_code, limiting practices and
     standardising variables/items, as requested.
@@ -1182,22 +1167,59 @@ def prepare_ds(ds, n_practices=None, standardise_values=False, standardise_items
         Input dataset with 'date' and 'practice_id' dimensions.
     n_practices : int or None
         If specified, limit to this many practices with most items.
-    standardise_values : bool
-        Whether to standardise all variables globally (except items, quantity, actual_cost).
+    adjust_predictors : str or None
+        Method to adjust predictor inputs before modelling. Options include:
+        'z-global': standardise values globally
+        'z-practice': standardise per practice
+        'c-global': centre globally
+        'c-practice': centre per practice
+        None: raw values
     standardise_items : bool
         Whether to standardise 'items' per practice.
-    seasonal_correction : bool
+    deseasonalise_predictors : bool
         Whether to do seasonal correction on predictors.
     """
+    # add date code as simpler data variable for models
     ds["date_code"] = ("date", np.arange(len(ds["date"])))  # integer months since start
     ds["date_code"] = (ds["date_code"] - ds["date_code"].mean()) / ds["date_code"].std()  # standardised
+
+    # limit practices if requested
     if n_practices is not None:
         practice_counts = ds["items"].sum(dim="date").sortby(ds["items"].sum(dim="date"),
                                                              ascending=False)
         top_practices = practice_counts["practice_id"].values[:n_practices]
         status(f"Limiting to top {n_practices} practices with most items")
         ds = ds.sel(practice_id=top_practices)
-    if seasonal_correction:
+    
+    # adjust predictor variables if requested
+    if adjust_predictors is not None:
+        # per practice centering/standardising
+        if adjust_predictors in ["c-practice", "z-practice"]:
+            status("Adjusting predictor values per practice")
+            for var in ds.data_vars:
+                if var not in ["items", "quantity", "actual_cost",
+                            "date", "date_code", "practice_id"]:
+                    mean = ds[var].groupby("practice_id").mean(dim="date")
+                    ds[var] = ds[var] - mean
+                    if adjust_predictors == "z-practice":
+                        std = ds[var].groupby("practice_id").std(dim="date") + 1e-8  # prevent div by zero
+                        ds[var] = ds[var] / std
+        # global centering/standardising
+        elif adjust_predictors in ["c-global", "z-global"]:
+            status("Adjusting predictor values globally")
+            for var in ds.data_vars:
+                if var not in ["items", "quantity", "actual_cost",
+                            "date", "date_code", "practice_id"]:
+                    mean = ds[var].mean(dim="date").mean(dim="practice_id")
+                    ds[var] = ds[var] - mean
+                    if adjust_predictors == "z-global":
+                        std = ds[var].std(dim="date").std(dim="practice_id") + 1e-8  # prevent div by zero
+                        ds[var] = ds[var] / std
+        else:
+            raise ValueError(f"Unknown adjust_predictors method: {adjust_predictors}")
+    
+    # seasonal correction of predictors if requested
+    if deseasonalise_predictors:
         status("Applying seasonal correction to predictor variables")
         for var in ds.data_vars:
             if var not in ["items", "quantity", "actual_cost",
@@ -1205,19 +1227,14 @@ def prepare_ds(ds, n_practices=None, standardise_values=False, standardise_items
                 monthly_means = ds[var].groupby("date.month").mean(dim="date")
                 monthly_means_expanded = monthly_means.sel(month=ds["date.month"])
                 ds[var] = ds[var] - monthly_means_expanded
-    if standardise_values:
-        status("Standardising predictor values globally")
-        for var in ds.data_vars:
-            if var not in ["items", "quantity", "actual_cost",
-                           "date", "date_code", "practice_id"]:
-                mean = ds[var].mean().item()
-                std = ds[var].std().item() + 1e-8  # prevent div by zero
-                ds[var] = (ds[var] - mean) / std
+    
+    # standardise prescription 'items' per practice if requested
     if standardise_items:
         status("Standardising 'items' per practice")
         mean = ds["items"].mean(dim="date")
         std = ds["items"].std(dim="date") + 1e-8  # prevent div by zero
         ds["items"] = (ds["items"] - mean) / std
+
     return ds
 
 def make_progress_callback(total_draws, total_tune):
@@ -1226,6 +1243,389 @@ def make_progress_callback(total_draws, total_tune):
         if pct % 10 == 0:
             print(f"Chain {chain}, {pct}% complete", flush=True)
     return progress_callback
+
+
+
+# ANALYSIS FUNCTIONS ==============================================================================
+def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, None), xlim_values=(None, None)):
+    """Compare individual mixed effects model analyses across prescription types.
+    Parameters
+    ----------
+    results_folder : str
+        Root folder where results are stored.
+    y_jitter : float, optional
+        Amount to jitter y-axis for visibility on combined plots, by default 0.15
+    xlim_flag : tuple, optional
+        (min, max) for x-axis limits on flag plot; None for automatic, by default (None, None)
+    xlim_values : tuple, optional
+        (min, max) for x-axis limits on values plot; None for automatic, by default (None, None)
+    """
+    # prescription type definitions (hardcoded for now)
+    prescription_codes = ['02_03_0501', '02', '03', '0501']
+    labels = ['All', 'Cardiovascular', 'Respiratory', 'Antibiotics']
+    colours = ['black', 'red', 'blue', 'orange']
+
+    # =============================================================================================
+    # load the data
+
+    # set input and output paths correctly
+    plot_root = f"{results_folder}"
+    results_folders = [f"{results_folder}{c}/" for c in prescription_codes]
+
+    # load data
+    os.makedirs(plot_root, exist_ok=True)
+    data_flag = []
+    data_values = []
+    datasets = []
+    for folder in results_folders:
+        try:
+            df_flag = pd.read_csv(f"{folder}/mixed_effects_flag_results.csv")
+            df_val = pd.read_csv(f"{folder}/mixed_effects_values_results.csv")
+        except FileNotFoundError:
+            print(f"Warning: could not find results in {folder}, skipping...")
+            continue
+        # skip empty results
+        if df_flag.empty and df_val.empty:
+            print(f"Warning: results in {folder} are empty, skipping...")
+            continue
+        df_flag["dataset"] = folder
+        df_val["dataset"] = folder
+        data_flag.append(df_flag)
+        data_values.append(df_val)
+
+    # safe concatenation: create empty DataFrames with expected columns if nothing was found
+    if data_flag:
+        df_flag_all = pd.concat(data_flag, ignore_index=True)
+    else:
+        df_flag_all = pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset"])
+
+    if data_values:
+        df_val_all = pd.concat(data_values, ignore_index=True)
+    else:
+        df_val_all = pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset"])
+
+    # =============================================================================================
+    # plot all on one figure
+
+    for hide_sulfur in [True, False]:
+        if not data_flag and not data_values:
+            print("No data available for plotting 'all' figure; skipping.")
+            continue
+
+        # determine how many series we actually have
+        n_flag_series = len(data_flag)
+        n_val_series = len(data_values)
+        labels_flag = labels[:n_flag_series]
+        colours_flag = colours[:n_flag_series]
+        labels_val = labels[:n_val_series]
+        colours_val = colours[:n_val_series]
+
+        # flagged + values in a 2-row figure
+        fig, axes = plt.subplots(2, 1, figsize=(10, 10), sharex=False)
+
+        # flagged
+        if n_flag_series > 0:
+            last_df = None
+            for i, (df, label, color) in enumerate(zip(data_flag, labels_flag, colours_flag)):
+                if hide_sulfur:
+                    df = df[~df["name"].str.contains("aqrean_daqi_sulfur_dioxide")]
+                last_df = df
+                y_pos = np.arange(len(df["name"])) + (i - n_flag_series / 2) * y_jitter
+                axes[0].errorbar(df["coef"], y_pos,
+                                    xerr=[df["coef"] - df["ci_low"], df["ci_high"] - df["coef"]],
+                                    fmt='o', color=color, label=label, markersize=3, capsize=2)
+            if last_df is not None:
+                axes[0].set_yticks(np.arange(len(last_df["name"])))
+                axes[0].set_yticklabels(last_df["name"])
+        else:
+            axes[0].text(0.5, 0.5, 'No flagged results', ha='center', va='center')
+
+        # values
+        if n_val_series > 0:
+            last_x = None
+            for i, (df, label, color) in enumerate(zip(data_values, labels_val, colours_val)):
+                x = df["name"].str.replace("_values", "")
+                last_x = x
+                y_pos = np.arange(len(df["name"])) + (i - n_val_series / 2) * y_jitter
+                axes[1].errorbar(df["coef"], y_pos,
+                                    xerr=[df["coef"] - df["ci_low"], df["ci_high"] - df["coef"]],
+                                    fmt='o', color=color, label=label, markersize=3, capsize=2)
+            if last_x is not None:
+                axes[1].set_yticks(np.arange(len(last_x)))
+                axes[1].set_yticklabels(last_x)
+        else:
+            axes[1].text(0.5, 0.5, 'No values results', ha='center', va='center')
+
+        # plot formatting
+        for ax in axes:
+            ax.axvline(0, color='black', lw=0.8)
+            ax.grid(True, linestyle=':', alpha=0.6)
+        axes[0].set_xlim(xlim_flag)
+        axes[1].set_xlim(xlim_values)
+        axes[0].set_title("Flagged models")
+        axes[1].set_title("Values models")
+        axes[1].set_xlabel("Coefficient estimate")
+        plt.tight_layout()
+        
+        # shared legend
+        handles, labels_ = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels_, loc='lower center', ncol=4, frameon=False)
+        fig.subplots_adjust(bottom=0.09)
+
+        if hide_sulfur:
+            plt.savefig(f"{plot_root}mixed_no_sulfur.png", dpi=300)
+        else:
+            plt.savefig(f"{plot_root}mixed.png", dpi=300)
+        plt.close(fig)
+
+
+    # =============================================================================================
+    # plot coefficient estimates for flagged variables individually (comparing datasets)
+
+    # if there are no flagged results, skip the per-variable flagged plots
+    if df_flag_all.empty:
+        print("No per-practice flagged results found; skipping flag variable plots.")
+        flag_varnames = []
+    else:
+        flag_varnames = sorted(df_flag_all["name"].unique())
+    os.makedirs(f"{plot_root}flags", exist_ok=True)
+    for var in flag_varnames:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        matched = False
+        for df, label, color in zip(data_flag, labels, colours):
+            sub = df[df["name"] == var]
+            if not sub.empty:
+                ax.errorbar(sub["coef"], label,
+                            xerr=[sub["coef"] - sub["ci_low"], sub["ci_high"] - sub["coef"]],
+                            fmt='o', color=color, markersize=5, capsize=4)
+                matched = True
+        if not matched:
+            plt.close(fig)
+            continue
+        ax.axvline(0, color='black', lw=0.8)
+        ax.grid(True, linestyle=':', alpha=0.6)
+        ax.set_title(f"{var}")
+        ax.set_xlabel("Coefficient estimate")
+        fig.tight_layout()
+        plt.savefig(f"{plot_root}flags/{var}.png", dpi=300)
+        plt.close(fig)
+
+    # =============================================================================================
+    # plot coefficient estimates for values variables individually (comparing datasets)
+
+    if df_val_all.empty:
+        print("No values results found; skipping value variable plots.")
+        val_varnames = []
+    else:
+        val_varnames = sorted(df_val_all["name"].str.replace("_values", "").unique())
+    os.makedirs(f"{plot_root}values", exist_ok=True)
+    for var in val_varnames:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        matched = False
+        for df, label, color in zip(data_values, labels, colours):
+            sub = df[df["name"].str.replace("_values", "") == var]
+            if not sub.empty:
+                ax.errorbar(sub["coef"], label,
+                            xerr=[sub["coef"] - sub["ci_low"], sub["ci_high"] - sub["coef"]],
+                            fmt='o', color=color, markersize=5, capsize=4)
+                matched = True
+        if not matched:
+            plt.close(fig)
+            continue
+        ax.axvline(0, color='black', lw=0.8)
+        ax.grid(True, linestyle=':', alpha=0.6)
+        ax.set_title(f"{var}")
+        ax.set_xlabel("Coefficient estimate")
+        fig.tight_layout()
+        plt.savefig(f"{plot_root}values/{var}.png", dpi=300)
+        plt.close(fig)
+
+def compare_bayesian_analyses(results_folder, y_jitter=0.15, generate_arviz_plots=True):
+    '''Generates plots to compare the Bayesian analysis results across different prescription types.
+
+    Parameters
+    ----------
+    results_folder : str
+        Root folder containing results subfolders for each prescription type.
+    y_jitter : float, optional
+        Vertical jitter amount between overlapping categories in the combined plot.
+    generate_arviz_plots : bool, optional
+        Whether to generate ArviZ diagnostic plots for each model.
+    '''
+    # prescription type definitions (hardcoded for now)
+    prescription_codes = ['02_03_0501', '02', '03', '0501']
+    labels = ['All', 'Cardiovascular', 'Respiratory', 'Antibiotics']
+    colours = ['black', 'red', 'blue', 'orange']
+
+    # fields in the analysis
+    value_vars = [
+        "hydro_rain",
+        "met_rain",
+        "met_tmax",
+        "aqrean_carbon_monoxide",
+        "aqrean_daqi_overall",
+        "aqrean_nitrogen_monoxide",
+        "aqrean_nitrogen_dioxide",
+        "aqrean_daqi_nitrogen_dioxide",
+        "aqrean_nox_expressed_as_nitrogen_dioxide",
+        "aqrean_ozone",
+        "aqrean_daqi_ozone",
+        "aqrean_pm2p5",
+        "aqrean_pm10",
+        "aqrean_daqi_pm10",
+        "aqrean_sulfur_dioxide",
+        "aqrean_daqi_sulfur_dioxide"
+    ]
+    value_vars = [ft + "_values" for ft in value_vars]
+
+    # set input and output paths correctly
+    results_roots = [
+        f"{results_folder}{c}/" for c in prescription_codes
+    ]
+    plot_root = f"{results_folder}"
+
+    # load data
+    idatas = []
+    dataframes = []
+    for root in results_roots:
+        csv_path = root + f"bayesian_model_summary.csv"
+        if not os.path.exists(csv_path):
+            print(f"Warning: could not find results at {csv_path}, skipping...")
+            continue
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            print(f"Warning: results in {csv_path} are empty, skipping...")
+            continue
+        df = df.rename(columns={"Unnamed: 0": "name"})
+        dataframes.append(df)
+
+    if not dataframes:
+        raise FileNotFoundError("No Bayesian results CSVs found — nothing to plot.")
+
+    # =================================================================================================
+    # all in one figure
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for i, (df, label, color) in enumerate(zip(dataframes, labels, colours)):
+        if df.empty:  # skip missing ones
+            continue
+
+        # get data for this var
+        df = df[df["name"].isin(value_vars)].copy()
+        df = df.set_index("name").reindex(value_vars)
+
+        # set jitter position and plot
+        y_pos = np.arange(len(value_vars)) + (i - len(dataframes) / 2) * y_jitter
+        ax.errorbar(
+            df["mean"], y_pos,
+            xerr=[df["mean"] - df["hdi_3%"], df["hdi_97%"] - df["mean"]],
+            fmt='o', color=color, label=label, markersize=4, capsize=3
+        )
+
+    # plot formatting
+    ax.axvline(0, color='black', lw=0.8)
+    ax.set_yticks(np.arange(len(value_vars)))
+    ax.set_yticklabels(value_vars)
+    ax.grid(True, linestyle=':', alpha=0.6)
+    ax.set_xlabel("Posterior mean (effect size)")
+    ax.set_title("Bayesian model coefficients comparison")
+    plt.tight_layout()
+    
+    # shared legend
+    handles, labels_ = ax.get_legend_handles_labels()
+    fig.legend(handles, labels_, loc='lower center', ncol=4, frameon=False)
+    fig.subplots_adjust(bottom=0.09)
+    plt.savefig(plot_root + f"bayesian.png", dpi=300)
+    plt.close(fig='all')
+
+    # =================================================================================================
+    # individual variable plots
+
+    plot_folder = f"{plot_root}values_bayes/"
+    os.makedirs(plot_folder, exist_ok=True)
+    for var in value_vars:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        matched = False
+        for df, label, color in zip(dataframes, labels, colours):
+            if df.empty:  # skip missing ones
+                continue
+
+            # extract var and plot
+            sub = df[df["name"] == var]
+            if not sub.empty:
+                ax.errorbar(
+                    sub["mean"], label,
+                    xerr=[sub["mean"] - sub["hdi_3%"], sub["hdi_97%"] - sub["mean"]],
+                    fmt='o', color=color, markersize=5, capsize=4
+                )
+                matched = True
+        if not matched:
+            plt.close(fig='all')
+            continue
+
+        # plot formatting and save
+        ax.axvline(0, color='black', lw=0.8)
+        ax.grid(True, linestyle=':', alpha=0.6)
+        ax.set_title(f"{var}")
+        ax.set_xlabel("Posterior mean (effect size)")
+        fig.tight_layout()
+        plt.savefig(f"{plot_folder}{var}.png", dpi=300)
+        plt.close(fig='all')
+
+    print(f"Plots saved to {plot_root}")
+
+    # =================================================================================================
+    # generate ArviZ diagnostic plots for each model
+
+    if generate_arviz_plots:
+        az.rcParams["plot.max_subplots"] = 40
+        for root in results_roots:
+            # get the inference data
+            nc_path = os.path.join(root, f"bayesian_model_idata.nc")
+            if not os.path.exists(nc_path):
+                print(f"Warning: no netCDF file found for at {nc_path}, skipping...")
+                continue
+            idata = az.from_netcdf(nc_path)
+            arviz_out_dir = root + f"bayesian_diagnostics/"
+            os.makedirs(arviz_out_dir, exist_ok=True)
+            posterior_vars = [v for v in idata.posterior.data_vars
+                            if "|" not in v and "C(" not in v]
+
+            # convergence plot
+            fig = az.plot_trace(idata, var_names=posterior_vars)
+            plt.tight_layout()
+            plt.savefig(os.path.join(arviz_out_dir, "convergence.png"), dpi=200)
+            plt.close(fig='all')
+
+            # posterior plot
+            fig = az.plot_posterior(
+                idata,
+                var_names=posterior_vars,
+                hdi_prob=0.94,
+                point_estimate="mean",
+                kind="hist",
+            )
+            plt.tight_layout()
+            plt.savefig(os.path.join(arviz_out_dir, "posterior.png"), dpi=200)
+            plt.close(fig='all')
+
+            # rank plots
+            fig = az.plot_rank(idata, var_names=posterior_vars)
+            plt.tight_layout()
+            plt.savefig(os.path.join(arviz_out_dir, "rank.png"), dpi=200)
+            plt.close(fig='all')
+
+            # posterior predictive checks
+            if "posterior_predictive" in idata.groups():
+                fig = az.plot_ppc(idata, num_pp_samples=100)
+                plt.tight_layout()
+                plt.savefig(os.path.join(arviz_out_dir, "ppc.png"), dpi=200)
+                plt.close(fig='all')
+            else:
+                print(f"Warning: no posterior predictive data foundin {nc_path}, skipping PPC.")
+            
+            print(f"Analysis diagnostic plots saved to {arviz_out_dir}")
+
 
 
 # GENERAL HELPERS =================================================================================

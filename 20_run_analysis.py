@@ -2,16 +2,24 @@
 # os.environ["PYTENSOR_FLAGS"] = "mode=NUMBA"  # for laptop runs
 
 import xarray as xr
-from funcs import run_all_flag_mixed_models, run_all_value_mixed_models, status
+from funcs import prepare_ds, run_all_flag_mixed_models, run_all_value_mixed_models, status
 
-# parameters
+# general parameters
 min_practice_obs = 20  # practices with fewer points will be excluded
 n_jobs = 12  # number of parallel jobs to run
-# seasonal_correction_in = False  # whether to apply seasonal correction to predictor variables
-seasonal_correction_out = True  # whether to include a seasonal correction term for output variable (items)
-practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope
-standardise_values = True  # whether to standardise values variables (global)
+n_practices = None  # limit to n practices with most data points (for testing, set None to use all practices)
+practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope (keep as 2 as runs within walltime)
+deseasonalise_output = True  # whether to include a seasonal correction term for output variable (items) (always True as adding seasonal term is inexpensive)
+
+# model parameters
+deseasonalise_predictors = False  # whether to apply seasonal correction to predictor variables
+adjust_predictors = 'c-practice'  # 'z-global': standardise values globally, 'z-practice': standardise per practice, 'c-global': centre globally, 'c-practice': centre per practice, None: raw values
 standardise_items = True  # whether to standardise items variable (per practice)
+
+# configure save folder name
+seasonal_str = "" if not deseasonalise_predictors else "_deseasonalised"
+standardise_str = "outputs_raw" if not standardise_items else "outputs_standardised"
+results_root = f"outputs/inputs_{adjust_predictors}{seasonal_str}/{standardise_str}/"
 
 # codes to process
 prescription_codes = ["02_03_0501", "02", "03", "0501"]
@@ -42,54 +50,47 @@ flag_types = [
 value_vars = [ft + "_values" for ft in flag_types if ft != "flood"]
 
 if __name__ == "__main__":
-    # loop through each file and run the models
-    for seasonal_correction_in in [False, True]:
-        for standardise_items in [False, True]:
-            for codes in prescription_codes:
-                # set the correct paths
-                if seasonal_correction_in:
-                    input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags_deseasonalised.nc"
-                    results_folder = f"outputs/prescriptions_{codes}_2010-08_2025-08/deseasonalised_inputs/"
-                else:
-                    input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags.nc"
-                    results_folder = f"outputs/prescriptions_{codes}_2010-08_2025-08/raw_inputs/"
-                
-                if standardise_items:
-                    results_folder += "standardised_outputs/"
-                else:
-                    results_folder += "raw_outputs/"
+    for codes in prescription_codes:
+        # set the correct paths
+        if deseasonalise_predictors:
+            input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags_deseasonalised.nc"
+        else:
+            input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags.nc"
+        results_folder = f"{results_root}{codes}/"
 
-                # get the data and set save folder
-                status(f"Processing file: {input_path} with standardised items = {standardise_items}")
-                ds = xr.open_dataset(input_path)
-                # run mixed models comparing flags
-                # compares:
-                #    flooding: flood == 1 to flood == 0
-                #    met and hydro: high/low to median periods
-                #    particulate mass: high == 1 to high == 0
-                #    particulate DAQI: (very high, high) to (moderate, low) and (very high, high, moderate) to (low)
-                status(f"Running mixed-effects models for flags...")
-                run_all_flag_mixed_models(ds,
-                                        flag_types,
-                                        results_folder,
-                                        seasonal_correction_out=seasonal_correction_out,
-                                        practice_correction=practice_correction,
-                                        standardise_items=standardise_items,
-                                        min_practice_obs=min_practice_obs,
-                                        n_jobs=n_jobs,)
+        # get the data and set save folder
+        status(f"Processing file: {input_path}")
+        ds = xr.open_dataset(input_path)
+        ds = prepare_ds(ds,
+                        n_practices=n_practices,
+                        standardise_items=standardise_items,
+                        adjust_predictors=adjust_predictors,
+                        deseasonalise_predictors=deseasonalise_predictors)
 
-                # run mixed models using raw measurements
-                # handles all variables except for flooding, as there are no values for this
-                status(f"Running mixed-effects models for values...")
-                run_all_value_mixed_models(ds,
-                                        value_vars,
-                                        results_folder,
-                                        seasonal_correction_in=seasonal_correction_in,
-                                        seasonal_correction_out=seasonal_correction_out,
-                                        practice_correction=practice_correction,
-                                        standardise_values=standardise_values,
-                                        standardise_items=standardise_items,
-                                        min_practice_obs=min_practice_obs,
-                                        n_jobs=n_jobs)
+        # run mixed models comparing flags
+        # compares:
+        #    flooding: flood == 1 to flood == 0
+        #    met and hydro: high/low to median periods
+        #    particulate mass: high == 1 to high == 0
+        #    particulate DAQI: (very high, high) to (moderate, low) and (very high, high, moderate) to (low)
+        status(f"Running mixed-effects models for flags...")
+        run_all_flag_mixed_models(ds,
+                                flag_types,
+                                results_folder,
+                                deseasonalise_output=deseasonalise_output,
+                                practice_correction=practice_correction,
+                                min_practice_obs=min_practice_obs,
+                                n_jobs=n_jobs,)
+
+        # run mixed models using raw measurements
+        # handles all variables except for flooding, as there are no values for this
+        status(f"Running mixed-effects models for values...")
+        run_all_value_mixed_models(ds,
+                                value_vars,
+                                results_folder,
+                                deseasonalise_output=deseasonalise_output,
+                                practice_correction=practice_correction,
+                                min_practice_obs=min_practice_obs,
+                                n_jobs=n_jobs)
 
     status("Script complete.")
