@@ -1,25 +1,28 @@
 import xarray as xr
+from time import perf_counter
 
-prescriptions_paths = [
-    "data/prescriptions_02_03_0501_2010-08_2025-08",
-    "data/prescriptions_02_2010-08_2025-08",
-    "data/prescriptions_03_2010-08_2025-08",
-    "data/prescriptions_0501_2010-08_2025-08"
-]
+def method1(ds, var):
+    mean = ds[var].groupby("practice_id").mean(dim="date")
+    ds[var] = ds[var] - mean
+    std = ds[var].groupby("practice_id").std(dim="date") + 1e-8  # prevent div by zero
+    ds[var] = ds[var] / std
+    return ds
 
-for path in prescriptions_paths:
-    ds1 = xr.load_dataset(path + "_with_flags.nc")
-    ds2 = xr.load_dataset(path + "_with_flags_deseasonalised.nc")
-    print(f"Comparing datasets for {path}:")
-    print(ds1)
-    print(ds2)
+def method2(ds, var):
+    mean = ds[var].mean(dim="date")
+    ds[var] = ds[var] - mean
+    std = ds[var].std(dim="date") + 1e-8  # prevent div by zero
+    ds[var] = ds[var] / std
+    return ds
 
+n = 5
+z = 0.0
+for _ in range(n):
+    ds = xr.load_dataset("data/prescriptions_02_2010-08_2025-08_with_flags.nc")
+    var = "met_rain_values"
 
-
-# finish download
-# rm -r pres/outputs/
-# qsend_mixed
-# qsend_bayes 02
-# qsend_bayes 03
-# qsend_bayes 0501
-# qsend_bayes 02_03_0501
+    z0 = perf_counter()
+    ds2 = method2(ds, var)
+    z1 = perf_counter()
+    z += z1 - z0
+print(f"Standardisation took {z / n:.2f} seconds.")

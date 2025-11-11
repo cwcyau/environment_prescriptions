@@ -51,7 +51,7 @@ value_vars = [ft + "_values" for ft in flag_types if ft != "flood"]
 
 if __name__ == "__main__":
     for codes in prescription_codes:
-        # set the correct paths
+        # set the path to get correct flags (generated from deseasonalised or non-deseasonalised values)
         if deseasonalise_predictors:
             input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags_deseasonalised.nc"
         else:
@@ -60,7 +60,7 @@ if __name__ == "__main__":
 
         # get the data and set save folder
         status(f"Processing file: {input_path}")
-        ds = xr.open_dataset(input_path)
+        ds = xr.load_dataset(input_path)
         ds = prepare_ds(ds,
                         n_practices=n_practices,
                         standardise_items=standardise_items,

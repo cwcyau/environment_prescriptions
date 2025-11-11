@@ -1197,23 +1197,21 @@ def prepare_ds(ds, n_practices=None, standardise_items=False, adjust_predictors=
         if adjust_predictors in ["c-practice", "z-practice"]:
             status("Adjusting predictor values per practice")
             for var in ds.data_vars:
-                if var not in ["items", "quantity", "actual_cost",
-                            "date", "date_code", "practice_id"]:
-                    mean = ds[var].groupby("practice_id").mean(dim="date")
+                if var.endswith("_values"):
+                    mean = ds[var].mean(dim="date")
                     ds[var] = ds[var] - mean
                     if adjust_predictors == "z-practice":
-                        std = ds[var].groupby("practice_id").std(dim="date") + 1e-8  # prevent div by zero
+                        std = ds[var].std(dim="date") + 1e-8  # prevent div by zero
                         ds[var] = ds[var] / std
         # global centering/standardising
         elif adjust_predictors in ["c-global", "z-global"]:
             status("Adjusting predictor values globally")
             for var in ds.data_vars:
-                if var not in ["items", "quantity", "actual_cost",
-                            "date", "date_code", "practice_id"]:
-                    mean = ds[var].mean(dim="date").mean(dim="practice_id")
+                if var.endswith("_values"):
+                    mean = ds[var].mean().item()
                     ds[var] = ds[var] - mean
                     if adjust_predictors == "z-global":
-                        std = ds[var].std(dim="date").std(dim="practice_id") + 1e-8  # prevent div by zero
+                        std = ds[var].std().item() + 1e-8  # prevent div by zero
                         ds[var] = ds[var] / std
         else:
             raise ValueError(f"Unknown adjust_predictors method: {adjust_predictors}")
@@ -1222,8 +1220,7 @@ def prepare_ds(ds, n_practices=None, standardise_items=False, adjust_predictors=
     if deseasonalise_predictors:
         status("Applying seasonal correction to predictor variables")
         for var in ds.data_vars:
-            if var not in ["items", "quantity", "actual_cost",
-                           "date", "date_code", "practice_id"]:
+            if var.endswith("_values"):
                 monthly_means = ds[var].groupby("date.month").mean(dim="date")
                 monthly_means_expanded = monthly_means.sel(month=ds["date.month"])
                 ds[var] = ds[var] - monthly_means_expanded
