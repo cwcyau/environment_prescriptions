@@ -3,3 +3,5 @@
 data/prescriptions_pre20200101/csvs/*
 *.nc
 __pycache__/
+notes.txt
+temp/

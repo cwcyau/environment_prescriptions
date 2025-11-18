@@ -119,6 +119,7 @@ for bnf_codes in bnf_codes_list:
         invalid_ids = list(ds['row_id'].values[invalid_mask])
         print(f"Dropping {len(invalid_ids)} practices with missing coordinates")
         ds = ds.drop_sel(row_id=invalid_ids)
+    ds = ds.rename({"row_id": "practice_id"})
 
     # =================================================================================================
     # save

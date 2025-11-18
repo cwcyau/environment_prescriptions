@@ -3,6 +3,8 @@ import re
 import xarray as xr
 import numpy as np
 
+# https://www.metoffice.gov.uk/research/climate/maps-and-data/historic-station-data
+
 # parameters
 folder_path = "data/met_office_stations/"  # met office data path
 output_file = "data/met_office_stations.nc"  # output nc file path

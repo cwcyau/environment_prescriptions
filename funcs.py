@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import bambi as bmb
 import arviz as az
+import xarray as xr
 import statsmodels.formula.api as smf
 import matplotlib.pyplot as plt
 from datetime import datetime
@@ -15,6 +16,7 @@ from joblib import Parallel, delayed
 from typing import List, Dict
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from patsy import dmatrix
 
 
 # DATA FUNCTIONS ==================================================================================
@@ -100,13 +102,13 @@ def add_hydrology_flags(prescriptions_ds, hydrology_ds,
 
     return prescriptions_ds
 
-def add_geojson_flood_flags(prescriptions_ds, geojson_features,
-                            search_radius_m=5000, simplify_tol=50):
+def add_geojson_flood_flags(prescriptions_ds, geojson_features, search_radius_m=5000, simplify_tol=50):
     """
     Add flood flags to the dataset based on geojson polygons.
     """
     lat_vec = prescriptions_ds.coords['latitude'].values
     lon_vec = prescriptions_ds.coords['longitude'].values
+    earliest_year = prescriptions_ds['date'].dt.year.min().item()
 
     # convert lat/lon to projected coordinates (EPSG:27700, British National Grid)
     transformer = Transformer.from_crs("EPSG:4326", "EPSG:27700", always_xy=True)
@@ -122,10 +124,10 @@ def add_geojson_flood_flags(prescriptions_ds, geojson_features,
                                errors="coerce")
         end = pd.to_datetime(f["properties"].get("end_date"),
                              errors="coerce")
-        if pd.isna(start) or start.year < 2020:
+        if pd.isna(start) or pd.isna(end) or end.year < earliest_year:
             continue
         geom = shape(f["geometry"])
-        geom = geom.simplify(simplify_tol, preserve_topology=True)
+        geom = geom.simplify(simplify_tol, preserve_topology=False)
         geom = geom.buffer(search_radius_m)
         end = end or start
         # assign polygon to each month it spans
@@ -161,7 +163,7 @@ def add_geojson_flood_flags(prescriptions_ds, geojson_features,
     return prescriptions_ds
 
 def add_met_flags(prescriptions_ds, met_ds,
-                  observed_properties=["tmax", "rain"],
+                  observed_properties=["tmax", "tmin", "rain"],
                   flag_types=["high", "low", "median"],
                   seasonal_correction=False):
     """
@@ -980,9 +982,9 @@ def run_bayesian_model(
     ds,
     raw_vars: list,
     results_folder: str,
-    file_suffix: str = "",
-    use_pca: bool = False,
-    n_components: int = None,
+    method: str = "standard",
+    pca_components: int = 4,
+    spline_df: int = 4,
     deseasonalise_output: bool = True,
     practice_correction: int = 1,
     min_practice_obs: int = 20,
@@ -1004,40 +1006,38 @@ def run_bayesian_model(
         Raw variable names to include as predictors.
     results_folder : str
         Folder path for saving results.
-    use_pca : bool
-        If True, apply PCA to predictors and use PCs as covariates.
-    n_components : int or None
+    method : str
+        One of "standard", "pca", or "splines":
+        - "standard": use raw variables (with optional polynomial and interaction terms).
+        - "pca": apply PCA to raw variables and use PCs as predictors (without polynomial or interaction terms).
+        - "splines": use spline terms for raw variables (dropping polynomial and interaction terms).
+    pca_components : int or None
         Number of PCA components; if None, keep all.
-    seasonal_correction_out : bool
+    spline_df: int
+        Degrees of freedom to use for each spline when use_splines is True.
+    deseasonalise_output : bool
         Whether to include month-of-year seasonal correction terms for the output variable.
-    seasonal_correction_in : bool
-        Whether to apply month-of-year seasonal correction to the predictor variables.
     practice_correction : int
         Level of practice-specific random effects:
         0 = none
         1 = intercept only
         2 = intercept + slope
         3 = intercept + slope + correlation.
-    adjust_inputs : str or None
-        Method to adjust predictor inputs before modelling. Options include:
-        'z-global': standardise values globally
-        'z-practice': standardise per practice
-        'c-global': centre globally
-        'c-practice': centre per practice
-        None: raw values
-    standardise_items : bool
-        Whether to standardise 'items' (per practice) before modelling.
-    n_practices : int or None
-        If specified, limit practices to this many with the most items (for testing).
     min_practice_obs : int
         Practices excluded if they have fewer than this number of observations.
     interactions : list of str
         Interactions to include, specified as "variable1 x variable2".
     poly_terms : dict
         Dictionary of {var_name: max_power} to create polynomial terms.
-    draws, tune, chains : int
-        Sampling parameters for Bambi.
-    
+    draws: int
+        Sampling draws for Bambi.
+    tune: int
+        Tuning steps for Bambi.
+    chains: int
+        Number of chains.
+    cores: int
+        Number of cores to run chains on.
+
     Returns
     -------
     model : bambi.Model
@@ -1048,54 +1048,91 @@ def run_bayesian_model(
     # check output folder
     os.makedirs(results_folder, exist_ok=True)
 
-    # prepare dataframe
+    # prepare dataframe for model input
     status("Preparing dataframe for model input...")
     df = ds[["items", "date_code"] + raw_vars].to_dataframe().reset_index()
     df["date"] = pd.to_datetime(df["date"])
     df["month"] = df["date"].dt.month
     df = df.dropna(subset=["items"]).copy()
     predictors = raw_vars.copy()
+    predictor_terms = raw_vars.copy()
 
-    # PCA if requested
-    if use_pca:
+    # Replace predictor terms with PCA if requested
+    if method == "pca":
         status("Applying PCA to raw variables...")
+        predictors = [v for v in raw_vars if v != "flood"]
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df[predictors])
-        pca = PCA(n_components=n_components)
+        pca = PCA(n_components=pca_components)
         pcs = pca.fit_transform(X_scaled)
         pc_names = [f"PC{i+1}" for i in range(pcs.shape[1])]
         df_pca = pd.DataFrame(pcs, columns=pc_names, index=df.index)
         df = pd.concat([df, df_pca], axis=1)
         predictors = pc_names
+        predictor_terms = pc_names
 
-    # polynomial terms
-    if poly_terms is not None:
-        status("Adding polynomial terms...")
-        poly_predictors = []
-        for var, power in poly_terms.items():
-            if var not in df.columns:
-                status(f"Warning: variable {var} not in dataframe, skipping polynomial term.")
-                continue
-            for p in range(2, power+1):
-                col_name = f"{var}_pow{p}"
-                df[col_name] = df[var]**p
-                poly_predictors.append(col_name)
-        predictors += poly_predictors
-
-    # interaction terms
-    interaction_terms = []
-    if interactions and not use_pca:
-        status("Adding interaction terms...")
-        for inter in interactions:
-            inter = inter.strip().replace(" ", "")
-            if "*" in inter:
-                interaction_terms.append(inter)
+    # Replace predictor_terms with spline terms if requested
+    elif method == "splines":
+        status(f"Using splines for predictors (df={spline_df}) and dropping linear interactions/polynomials...")
+        # Build spline terms replacing the raw variable names.
+        # Use the `s()` notation in the formula; Bambi will decide actual basis/penalties.
+        spline_terms = []
+        for v in raw_vars:
+            if v in df.columns and v != "flood":
+                spline_terms.append(f"bs({v}, df={spline_df})")
             else:
-                raise ValueError(f"Interaction '{inter}' must be specified using '*' between variable names.")
-        predictors += interaction_terms
+                status(f"Warning: variable {v} not found in dataframe, skipping spline for it.")
+        predictor_terms = spline_terms
+        # note: polynomial terms and explicit interaction terms are intentionally dropped when using splines
+
+    # otherwise apply any polynomial and interaction terms
+    elif method == "standard":
+        # add polynomial terms
+        if poly_terms is not None:
+            status("Adding polynomial terms...")
+            poly_predictors = []
+            for var, power in poly_terms.items():
+                if var not in df.columns:
+                    status(f"Warning: variable {var} not in dataframe, skipping polynomial term.")
+                    continue
+                for p in range(2, power+1):
+                    col_name = f"{var}_pow{p}"
+                    df[col_name] = df[var]**p
+                    poly_predictors.append(col_name)
+            predictor_terms += poly_predictors
+
+        # add interaction terms
+        interaction_terms = []
+        if interactions is not None:
+            status("Adding interaction terms...")
+            for inter in interactions:
+                inter = inter.strip().replace(" ", "").replace("flood", "C(flood)")
+                if "*" in inter:
+                    interaction_terms.append(inter)
+                else:
+                    raise ValueError(f"Interaction '{inter}' must be specified using '*' between variable names.")
+            predictor_terms += interaction_terms
+    
+    else:
+        raise ValueError("method must be one of 'standard', 'pca', or 'splines'")
+    
+    # make flood flags a categorical variable
+    if "flood" in predictor_terms:
+        predictor_terms = [("C(flood)" if term == "flood" else term)
+                           for term in predictor_terms]
+
+    # set sensible priors manually
+    priors = {}
+    for term in predictor_terms:
+        # spline, categorical and interaction terms are handled automatically
+        if term.startswith("bs(") or term.startswith("C(") or "*" in term:
+            continue
+        else:  # set priors for continuous variables by their standard deviation
+            sd = df[term].std()
+            priors[term] = bmb.Prior("Normal", mu=0, sigma=2*sd)
 
     # build formula
-    formula = "items ~ " + " + ".join(predictors)
+    formula = "items ~ " + " + ".join(predictor_terms)
     if deseasonalise_output:
         formula += " + C(month)"
     if practice_correction == 1:
@@ -1107,7 +1144,7 @@ def run_bayesian_model(
     elif practice_correction != 0:
         raise ValueError("practice_correction must be 0, 1, 2, or 3")
 
-    # clear out any nan predictors
+    # clear out any nan predictors (note: when using splines Bambi will still require predictor columns present)
     df = df.dropna(subset=predictors).copy()
     df = df[['items'] + predictors + ['practice_id', 'month', 'date_code']]
 
@@ -1122,23 +1159,23 @@ def run_bayesian_model(
 
     # fit Bayesian model
     status(f"Fitting Bambi model with formula '{formula}'...")
-    model = bmb.Model(formula, df)
-    # progress_callback = make_progress_callback(draws, tune)
+    # Use Bambi defaults for fixed-effect priors and residual priors.
+    # We intentionally do not override Bambi's sensible defaults for fixed effects and splines.
+    # If needed later, user can supply an explicit `priors` dict when calling this function.
+    model = bmb.Model(formula, df, priors=priors)
     idata = model.fit(draws=draws,
                       tune=tune,
                       chains=chains,
                       cores=cores,)
-                    #   progressbar=False,
-                    #   callback=[progress_callback])
 
     # save summary
     summary_df = az.summary(idata)
-    summary_csv = os.path.join(results_folder, f"bayesian_model_summary{file_suffix}.csv")
+    summary_csv = os.path.join(results_folder, f"bayesian_model_summary.csv")
     summary_df.to_csv(summary_csv)
     status(f"Posterior summary saved to: {summary_csv}")
 
     # prettier text summary
-    out_txt = os.path.join(results_folder, f"bayesian_model_summary{file_suffix}.txt")
+    out_txt = os.path.join(results_folder, f"bayesian_model_summary.txt")
     max_name_len = summary_df.index.str.len().max()
     with open(out_txt, "w") as f:
         for var, row in summary_df.iterrows():
@@ -1149,7 +1186,7 @@ def run_bayesian_model(
     status(f"Text summary saved to: {out_txt}")
 
     # save the model
-    idata_path = os.path.join(results_folder, f"bayesian_model_idata{file_suffix}.nc")
+    idata_path = os.path.join(results_folder, f"bayesian_model_idata.nc")
     az.to_netcdf(idata, idata_path)
     status(f"Model results saved to: {idata_path}")
 
@@ -1623,6 +1660,141 @@ def compare_bayesian_analyses(results_folder, y_jitter=0.15, generate_arviz_plot
             
             print(f"Analysis diagnostic plots saved to {arviz_out_dir}")
 
+def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15):
+    """
+    Generate posterior plots for spline and categorical variables across multiple prescription types.
+    Each variable gets a separate figure with one line per prescription type.
+
+    Automatically detects spline variables (bs(...)) and categorical variables (C(...)) from idata.
+    Uses the original input data to determine grid limits for splines.
+
+    Parameters
+    ----------
+    results_folder : str
+        Root folder containing model outputs for each prescription type.
+    n_points : int
+        Number of points in prediction grid for continuous spline variables.
+    y_jitter : float
+        Vertical jitter for categorical variables when plotting multiple prescription types.
+    """
+    prescription_codes = ['02_03_0501', '02', '03', '0501']
+    colours = ['black', 'red', 'blue', 'orange']
+
+    # preload idata and original datasets
+    idata_dict = {}
+    data_dict = {}
+    for pres_code in prescription_codes:
+        # load idata
+        nc_path = os.path.join(results_folder, pres_code, "bayesian_model_idata.nc")
+        if os.path.exists(nc_path):
+            idata_dict[pres_code] = az.from_netcdf(nc_path)
+        else:
+            print(f"Warning: no idata file for {pres_code}, skipping.")
+            idata_dict[pres_code] = None
+
+        # load original dataset for grid calculation
+        data_path = f"data/prescriptions_{pres_code}_2010-08_2025-08_with_flags.nc"
+        if os.path.exists(data_path):
+            data_dict[pres_code] = xr.open_dataset(data_path)
+        else:
+            print(f"Warning: no input data file for {pres_code}, skipping.")
+            data_dict[pres_code] = None
+
+    # detect spline and categorical variables
+    spline_vars = set()
+    categorical_vars = set()
+    for idata in idata_dict.values():
+        if idata is None:
+            continue
+        for var in idata.posterior.data_vars:
+            if var.startswith("bs("):
+                name = var.split("(")[1].split(",")[0]
+                spline_vars.add(name)
+            elif "C(" in var:
+                name = var.split("C(")[1].split(")")[0]
+                categorical_vars.add(name)
+    spline_vars = sorted(spline_vars)
+    categorical_vars = sorted(categorical_vars)
+
+    print(f"Detected spline variables: {spline_vars}")
+    print(f"Detected categorical variables: {categorical_vars}")
+
+    # loop over variables and plot
+    for var in spline_vars + categorical_vars:
+        fig, ax = plt.subplots(figsize=(6, 4))
+
+        for i, (pres_code, color) in enumerate(zip(prescription_codes, colours)):
+            idata = idata_dict[pres_code]
+            ds = data_dict[pres_code]
+            if idata is None or ds is None:
+                continue
+
+            # spline variables
+            if var in spline_vars:
+                var_idata = [v for v in idata.posterior.data_vars if v.startswith(f"bs({var}")][0]
+                if not var_idata:
+                    continue
+
+                # x-axis from original data
+                if var in ds:
+                    x_min, x_max = ds[var].min().item(), ds[var].max().item()
+                else:
+                    x_min, x_max = 0, 1
+                x = np.linspace(x_min, x_max, n_points)
+
+                # matrix for posterior predictions
+                n_basis = idata.posterior[var_idata].shape[-1]
+                X_grid = dmatrix(f"bs({var}, df={n_basis}, include_intercept=False) - 1",
+                                 data={var: x})
+
+                # calculate effects from posterior coefficients and plot
+                samples = idata.posterior[var_idata].stack(samples=("chain", "draw")).values
+                effects = samples.T @ X_grid.T
+                mean_effect = effects.mean(axis=0)
+                hdi_low, hdi_high = np.percentile(effects, [3, 97], axis=0)
+                ax.plot(x, mean_effect, color=color, label=pres_code)
+                ax.fill_between(x, hdi_low, hdi_high, color=color, alpha=0.3)
+
+            # categorical variables
+            elif var in categorical_vars:
+                var_idata = f"C({var})"
+                if var_idata not in idata.posterior:
+                    continue
+
+                # get values with shape [chains, draws, categories]
+                vals = idata.posterior[var_idata].values
+
+                # calculate stats for plotting
+                means = np.mean(vals, axis=(0,1))
+                lows = np.percentile(vals, 3, axis=(0,1))
+                highs = np.percentile(vals, 97, axis=(0,1))
+
+                # extract categories
+                categories = idata.posterior[var_idata].coords[f'C({var})_dim'].values
+                n_categories = len(categories)
+
+                # plot
+                y_pos = np.arange(n_categories) + y_jitter*(i - (len(prescription_codes)-1)/2)
+                ax.errorbar(y_pos, means, yerr=[means - lows, highs - means],
+                            fmt='o', color=color, label=pres_code)
+                ax.axhline(0, color='k', linestyle='--', zorder=0)
+                ax.set_xticks(np.arange(n_categories))
+                ax.set_xticklabels([str(c) for c in categories])
+
+        ax.set_title(f"{var} posterior effect")
+        ax.set_ylabel("Effect on items")
+        ax.set_xlabel(var if var in spline_vars else "Level")
+        ax.grid(True, linestyle=":", alpha=0.6)
+        ax.legend(frameon=False)
+        plt.tight_layout()
+
+        out_dir = os.path.join(results_folder, "splines_posteriors")
+        os.makedirs(out_dir, exist_ok=True)
+        plt.savefig(os.path.join(out_dir, f"{var}.png"), dpi=300)
+        plt.close(fig)
+
+    print(f"All spline and categorical plots saved to {out_dir}")
+
 
 
 # GENERAL HELPERS =================================================================================
@@ -1891,3 +2063,185 @@ def remove_seasonal_effects_old(datetimes, values):
     m = month_nums - 1
     monthly_anomalies = (values - medians[m]) / (mads[m] + 1e-9)
     return monthly_anomalies
+
+def run_bayesian_model_old(
+    ds,
+    raw_vars: list,
+    results_folder: str,
+    file_suffix: str = "",
+    use_pca: bool = False,
+    n_components: int = None,
+    deseasonalise_output: bool = True,
+    practice_correction: int = 1,
+    min_practice_obs: int = 20,
+    interactions: list = None,
+    poly_terms: dict = None,
+    draws: int = 2000,
+    tune: int = 1000,
+    chains: int = 4,
+    cores: int = 4,
+):
+    """
+    Fit a hierarchical Bayesian model of prescription 'items' using raw environmental variables.
+    
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Dataset containing 'items' and raw variables.
+    raw_vars : list of str
+        Raw variable names to include as predictors.
+    results_folder : str
+        Folder path for saving results.
+    use_pca : bool
+        If True, apply PCA to predictors and use PCs as covariates.
+    n_components : int or None
+        Number of PCA components; if None, keep all.
+    seasonal_correction_out : bool
+        Whether to include month-of-year seasonal correction terms for the output variable.
+    seasonal_correction_in : bool
+        Whether to apply month-of-year seasonal correction to the predictor variables.
+    practice_correction : int
+        Level of practice-specific random effects:
+        0 = none
+        1 = intercept only
+        2 = intercept + slope
+        3 = intercept + slope + correlation.
+    adjust_inputs : str or None
+        Method to adjust predictor inputs before modelling. Options include:
+        'z-global': standardise values globally
+        'z-practice': standardise per practice
+        'c-global': centre globally
+        'c-practice': centre per practice
+        None: raw values
+    standardise_items : bool
+        Whether to standardise 'items' (per practice) before modelling.
+    n_practices : int or None
+        If specified, limit practices to this many with the most items (for testing).
+    min_practice_obs : int
+        Practices excluded if they have fewer than this number of observations.
+    interactions : list of str
+        Interactions to include, specified as "variable1 x variable2".
+    poly_terms : dict
+        Dictionary of {var_name: max_power} to create polynomial terms.
+    draws, tune, chains : int
+        Sampling parameters for Bambi.
+    
+    Returns
+    -------
+    model : bambi.Model
+        Fitted model.
+    idata : arviz.InferenceData
+        Posterior draws.
+    """
+    # check output folder
+    os.makedirs(results_folder, exist_ok=True)
+
+    # prepare dataframe
+    status("Preparing dataframe for model input...")
+    df = ds[["items", "date_code"] + raw_vars].to_dataframe().reset_index()
+    df["date"] = pd.to_datetime(df["date"])
+    df["month"] = df["date"].dt.month
+    df = df.dropna(subset=["items"]).copy()
+    predictors = raw_vars.copy()
+    predictor_terms = raw_vars.copy()
+
+    # PCA if requested
+    if use_pca:
+        status("Applying PCA to raw variables...")
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(df[predictors])
+        pca = PCA(n_components=n_components)
+        pcs = pca.fit_transform(X_scaled)
+        pc_names = [f"PC{i+1}" for i in range(pcs.shape[1])]
+        df_pca = pd.DataFrame(pcs, columns=pc_names, index=df.index)
+        df = pd.concat([df, df_pca], axis=1)
+        predictors = pc_names
+        predictor_terms = pc_names
+    
+    else:  # only use poly terms and interactions if not using PCA
+        # polynomial terms
+        if poly_terms is not None:
+            status("Adding polynomial terms...")
+            poly_predictors = []
+            for var, power in poly_terms.items():
+                if var not in df.columns:
+                    status(f"Warning: variable {var} not in dataframe, skipping polynomial term.")
+                    continue
+                for p in range(2, power+1):
+                    col_name = f"{var}_pow{p}"
+                    df[col_name] = df[var]**p
+                    poly_predictors.append(col_name)
+            predictor_terms += poly_predictors
+
+        # interaction terms
+        interaction_terms = []
+        if interactions and not use_pca:
+            status("Adding interaction terms...")
+            for inter in interactions:
+                inter = inter.strip().replace(" ", "")
+                if "*" in inter:
+                    interaction_terms.append(inter)
+                else:
+                    raise ValueError(f"Interaction '{inter}' must be specified using '*' between variable names.")
+            predictor_terms += interaction_terms
+
+    # build formula
+    formula = "items ~ " + " + ".join(predictor_terms)
+    if deseasonalise_output:
+        formula += " + C(month)"
+    if practice_correction == 1:
+        formula += " + (1 | practice_id)"  # intercept
+    elif practice_correction == 2:
+        formula += " + (1 | practice_id) + (0 + date_code | practice_id)"  # intercept + slope, uncorrelated
+    elif practice_correction == 3:
+        formula += " + (date_code | practice_id)"  # intercept + slope, correlated
+    elif practice_correction != 0:
+        raise ValueError("practice_correction must be 0, 1, 2, or 3")
+
+    # clear out any nan predictors
+    df = df.dropna(subset=predictors).copy()
+    df = df[['items'] + predictors + ['practice_id', 'month', 'date_code']]
+
+    # filter practices
+    practice_counts = df.groupby('practice_id').size()
+    valid_practices = practice_counts[practice_counts >= min_practice_obs].index
+    df = df[df['practice_id'].isin(valid_practices)]
+    if df.empty:
+        raise ValueError("No practices with sufficient observations after filtering.")
+    else:
+        status(f"Using {len(valid_practices)} practices with >= {min_practice_obs} observations.")
+
+    # fit Bayesian model
+    status(f"Fitting Bambi model with formula '{formula}'...")
+    model = bmb.Model(formula, df)
+    # progress_callback = make_progress_callback(draws, tune)
+    idata = model.fit(draws=draws,
+                      tune=tune,
+                      chains=chains,
+                      cores=cores,)
+                    #   progressbar=False,
+                    #   callback=[progress_callback])
+
+    # save summary
+    summary_df = az.summary(idata)
+    summary_csv = os.path.join(results_folder, f"bayesian_model_summary{file_suffix}.csv")
+    summary_df.to_csv(summary_csv)
+    status(f"Posterior summary saved to: {summary_csv}")
+
+    # prettier text summary
+    out_txt = os.path.join(results_folder, f"bayesian_model_summary{file_suffix}.txt")
+    max_name_len = summary_df.index.str.len().max()
+    with open(out_txt, "w") as f:
+        for var, row in summary_df.iterrows():
+            mean = row['mean']
+            hdi_3pc = row['hdi_3%']
+            hdi_97pc = row['hdi_97%']
+            f.write(f"{var.ljust(max_name_len)} : {mean:8.2f} (CI: {hdi_3pc:8.2f}, {hdi_97pc:8.2f})\n")
+    status(f"Text summary saved to: {out_txt}")
+
+    # save the model
+    idata_path = os.path.join(results_folder, f"bayesian_model_idata{file_suffix}.nc")
+    az.to_netcdf(idata, idata_path)
+    status(f"Model results saved to: {idata_path}")
+
+    return model, idata

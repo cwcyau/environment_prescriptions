@@ -1,18 +1,20 @@
-from funcs import compare_individual_analyses, compare_bayesian_analyses
+from funcs import compare_individual_analyses, compare_bayesian_analyses, compare_bayesian_spline_analyses, status
 import os
 
-# plot individual analyses
-compare_bayesian_analyses("outputs/inputs_c-practice/outputs_standardised/interactions/")
-compare_individual_analyses("outputs/inputs_c-practice/outputs_standardised/")
+# PLOT INDIVIDUAL ANALYSES ========================================================================
+# compare_bayesian_analyses("outputs/inputs_c-practice/outputs_standardised/interactions/")
+# compare_individual_analyses("outputs/inputs_c-practice/outputs_standardised/")
+compare_bayesian_spline_analyses("outputs/bayes_test/")
 
 
 # PLOT ALL ANALYSES ===============================================================================
+
 # # parameters
 # codes = ["02_03_0501", "02", "03", "0501"]
 # input_types = ["inputs_c-practice", "inputs_c-practice_deseasonalised",
 #                "inputs_z-global", "inputs_z-global_deseasonalised"]
 # outputs_types = ["outputs_standardised", "outputs_raw"]
-# suffix_types = ["interactions/"]
+# suffix_types = ["", "interactions/"]
 # mixed_file = "mixed_effects_values_results.txt"
 # bayes_file = "bayesian_model_idata.nc"
 
@@ -33,8 +35,10 @@ compare_individual_analyses("outputs/inputs_c-practice/outputs_standardised/")
 #             if all(folders_bayes):
 #                 bayes_folders.append(results_folder)
 
-# # compare analyses for each configuration found
+# compare analyses for each configuration found
 # for folder in mixed_folders:
+#     status("Plotting individual analyses for folder:", folder)
 #     compare_individual_analyses(folder)
 # for folder in bayes_folders:
+#     status("Plotting Bayesian analyses for folder:", folder)
 #     compare_bayesian_analyses(folder)
