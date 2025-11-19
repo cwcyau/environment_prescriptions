@@ -5,3 +5,4 @@ data/prescriptions_pre20200101/csvs/*
 __pycache__/
 notes.txt
 temp/
+data/deprivation_indices/indices-of-deprivation-2025.csv

@@ -1,51 +1,10 @@
-import numpy as np
-import matplotlib.pyplot as plt
+import xarray as xr
 
-a = ["sigma", "Intercept", "hydro_rain_values", "met_rain_values", "met_tmax_values", "aqrean_carbon_monoxide_values",
- "aqrean_daqi_overall_values", "aqrean_nitrogen_monoxide_values", "aqrean_nitrogen_dioxide_values",
- "aqrean_daqi_nitrogen_dioxide_values", "aqrean_nox_expressed_as_nitrogen_dioxide_values", "aqrean_ozone_values",
- "aqrean_daqi_ozone_values", "aqrean_pm2p5_values", "aqrean_pm10_values", "aqrean_daqi_pm10_values", "aqrean_sulfur_dioxide_values",
- "aqrean_daqi_sulfur_dioxide_values",
- "hydro_rain_values:met_rain_values", "met_rain_values:met_tmax_values", "hydro_rain_values:met_tmax_values",
- "aqrean_nitrogen_dioxide_values:aqrean_nox_expressed_as_nitrogen_dioxide_values",
- "aqrean_nitrogen_monoxide_values:aqrean_nox_expressed_as_nitrogen_dioxide_values",
- "aqrean_daqi_overall_values:aqrean_daqi_nitrogen_dioxide_values", "aqrean_daqi_overall_values:aqrean_daqi_ozone_values",
- "aqrean_daqi_overall_values:aqrean_daqi_pm10_values", "aqrean_daqi_overall_values:aqrean_daqi_sulfur_dioxide_values",
- "aqrean_daqi_nitrogen_dioxide_values:aqrean_nitrogen_dioxide_values", "aqrean_daqi_ozone_values:aqrean_ozone_values",
- "aqrean_daqi_pm10_values:aqrean_pm10_values", "aqrean_daqi_sulfur_dioxide_values:aqrean_sulfur_dioxide_values",
- "C(month)", "1|practice_id_sigma", "1|practice_id_offset", "date_code|practice_id_sigma", "date_code|practice_id_offset"]
+ds = xr.open_dataset("data/prescriptions_02_03_0501_2010-08_2025-08_with_flags.nc")
+ds2 = xr.open_dataset("data/prescriptions_02_03_0501_2010-08_2025-08_with_flags_new.nc")
 
-b = ["sigma", "Intercept", "C(flood)", "hydro_rain_values", "met_rain_values", "met_tmax_values", "met_tmin_values",
-     "aqrean_carbon_monoxide_values", "aqrean_daqi_overall_values", "aqrean_nitrogen_monoxide_values",
-     "aqrean_nitrogen_dioxide_values", "aqrean_daqi_nitrogen_dioxide_values", "aqrean_nox_expressed_as_nitrogen_dioxide_values",
-     "aqrean_ozone_values", "aqrean_daqi_ozone_values", "aqrean_pm2p5_values", "aqrean_daqi_pm2p5_values", "aqrean_pm10_values",
-     "aqrean_daqi_pm10_values", "aqrean_sulfur_dioxide_values", "aqrean_daqi_sulfur_dioxide_values", "C(flood):hydro_rain_values",
-     "C(flood):met_rain_values", "hydro_rain_values:met_rain_values", "met_tmax_values:aqrean_carbon_monoxide_values",
-     "met_tmax_values:aqrean_nitrogen_monoxide_values", "met_tmax_values:aqrean_nitrogen_dioxide_values",
-     "met_tmax_values:aqrean_nox_expressed_as_nitrogen_dioxide_values", "met_tmax_values:aqrean_ozone_values",
-     "met_tmin_values:aqrean_carbon_monoxide_values", "met_tmin_values:aqrean_nitrogen_monoxide_values",
-     "met_tmin_values:aqrean_nitrogen_dioxide_values", "met_tmin_values:aqrean_nox_expressed_as_nitrogen_dioxide_values",
-     "met_tmin_values:aqrean_ozone_values", "aqrean_carbon_monoxide_values:aqrean_nitrogen_monoxide_values",
-     "aqrean_carbon_monoxide_values:aqrean_nitrogen_dioxide_values",
-     "aqrean_carbon_monoxide_values:aqrean_nox_expressed_as_nitrogen_dioxide_values",
-     "aqrean_daqi_overall_values:aqrean_pm2p5_values", "aqrean_daqi_overall_values:aqrean_daqi_pm2p5_values",
-     "aqrean_daqi_overall_values:aqrean_pm10_values", "aqrean_daqi_overall_values:aqrean_daqi_pm10_values",
-     "aqrean_nitrogen_monoxide_values:aqrean_nitrogen_dioxide_values",
-     "aqrean_nitrogen_monoxide_values:aqrean_daqi_nitrogen_dioxide_values",
-     "aqrean_nitrogen_monoxide_values:aqrean_nox_expressed_as_nitrogen_dioxide_values",
-     "aqrean_nitrogen_monoxide_values:aqrean_ozone_values", "aqrean_nitrogen_monoxide_values:aqrean_sulfur_dioxide_values",
-     "aqrean_nitrogen_dioxide_values:aqrean_daqi_nitrogen_dioxide_values",
-     "aqrean_nitrogen_dioxide_values:aqrean_nox_expressed_as_nitrogen_dioxide_values",
-     "aqrean_nitrogen_dioxide_values:aqrean_sulfur_dioxide_values",
-     "aqrean_daqi_nitrogen_dioxide_values:aqrean_nox_expressed_as_nitrogen_dioxide_values",
-     "aqrean_nox_expressed_as_nitrogen_dioxide_values:aqrean_ozone_values",
-     "aqrean_nox_expressed_as_nitrogen_dioxide_values:aqrean_sulfur_dioxide_values",
-     "aqrean_ozone_values:aqrean_daqi_ozone_values", "aqrean_pm2p5_values:aqrean_daqi_pm2p5_values",
-     "aqrean_pm2p5_values:aqrean_pm10_values", "aqrean_pm2p5_values:aqrean_daqi_pm10_values",
-     "aqrean_daqi_pm2p5_values:aqrean_pm10_values", "aqrean_daqi_pm2p5_values:aqrean_daqi_pm10_values",
-     "aqrean_pm10_values:aqrean_daqi_pm10_values", "aqrean_sulfur_dioxide_values:aqrean_daqi_sulfur_dioxide_values",
-     "C(month)", "1|practice_id_sigma", "1|practice_id_offset", "date_code|practice_id_sigma", "date_code|practice_id_offset"]
-
-a = [i for i in a if ":" in i]
-b = [i for i in b if ":" in i]
-print(len(a), len(b))
+print(ds)
+print()
+print('---------------')
+print()
+print(ds2)

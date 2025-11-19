@@ -1,25 +1,16 @@
-# import os
-# os.environ["PYTENSOR_FLAGS"] = "mode=NUMBA"  # for laptop runs
-
 import xarray as xr
 from funcs import prepare_ds, run_all_flag_mixed_models, run_all_value_mixed_models, status
 
-# general parameters
+# parameters
 min_practice_obs = 20  # practices with fewer points will be excluded
 n_jobs = 12  # number of parallel jobs to run
 n_practices = None  # limit to n practices with most data points (for testing, set None to use all practices)
 practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope (keep as 2 as runs within walltime)
 deseasonalise_output = True  # whether to include a seasonal correction term for output variable (items) (always True as adding seasonal term is inexpensive)
-
-# model parameters
 deseasonalise_predictors = False  # whether to apply seasonal correction to predictor variables
-adjust_predictors = 'c-practice'  # 'z-global': standardise values globally, 'z-practice': standardise per practice, 'c-global': centre globally, 'c-practice': centre per practice, None: raw values
+adjust_predictors = 'c-global'  # 'z-global': standardise values globally, 'z-practice': standardise per practice, 'c-global': centre globally, 'c-practice': centre per practice, None: raw values
 standardise_items = True  # whether to standardise items variable (per practice)
-
-# configure save folder name
-seasonal_str = "" if not deseasonalise_predictors else "_deseasonalised"
-standardise_str = "outputs_raw" if not standardise_items else "outputs_standardised"
-results_root = f"outputs/inputs_{adjust_predictors}{seasonal_str}/{standardise_str}/"
+results_root = "outputs/mixed_effects/"
 
 # codes to process
 prescription_codes = ["02_03_0501", "02", "03", "0501"]
@@ -30,6 +21,7 @@ flag_types = [
     "hydro_rain",
     "met_rain",
     "met_tmax",
+    "met_tmin",
     "flood", 
     "aqrean_carbon_monoxide",
     "aqrean_daqi_overall",

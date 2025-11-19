@@ -35,23 +35,17 @@ min_obs_per_practice = 20  # practices with fewer points will be excluded
 use_pca = False  # whether to use raw values (False) or PCA to reduce dimensionality of factors (True) (keep False as can run full model within walltime)
 practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope, 3 = intercept + slope + correlation (keep as 2 as runs within walltime)
 deseasonalise_output = True  # whether to include a seasonal correction term for output variable (items) (always True as adding seasonal term is inexpensive)
+deseasonalise_predictors = False  # whether to apply seasonal correction to predictor variables
+adjust_predictors = 'c-global'  # 'z-global': standardise values globally, 'z-practice': standardise per practice, 'c-global': centre globally, 'c-practice': centre per practice, None: raw values
+standardise_items = True  # whether to standardise items variable (per practice)
+results_folder = f"outputs/bayes_{method}/{prescription_code}/"
 draws = 3000  # number of MCMC draws
 tune = 3000  # number of tuning steps
 chains = 8  # number of MCMC chains
 cores = 8  # number of CPU cores to use
 
-# model parameters
-deseasonalise_predictors = False  # whether to apply seasonal correction to predictor variables
-adjust_predictors = 'c-practice'  # 'z-global': standardise values globally, 'z-practice': standardise per practice, 'c-global': centre globally, 'c-practice': centre per practice, None: raw values
-standardise_items = True  # whether to standardise items variable (per practice)
-
-# configure save folder name
-seasonal_str = "" if not deseasonalise_predictors else "_deseasonalised"
-standardise_str = "outputs_raw" if not standardise_items else "outputs_standardised"
-results_root = f"outputs/inputs_{adjust_predictors}{seasonal_str}/{standardise_str}/{method}/{prescription_code}/"
-
 # names of values to analyse
-value_vars = [
+predictors = [
     "flood",
     "hydro_rain_values",
     "met_rain_values",
@@ -89,7 +83,6 @@ interactions = [
 if __name__ == "__main__":
     # set files/folder paths
     prescriptions_path = f"data/prescriptions_{prescription_code}_2010-08_2025-08_with_flags.nc"
-    results_folder = f"{results_root}{prescription_code}/"
 
     # collect and prepare the dataset
     status(f"Processing file: {prescriptions_path}")
@@ -104,7 +97,7 @@ if __name__ == "__main__":
     # run the bayesian models
     run_bayesian_model(
         ds,
-        raw_vars=value_vars,
+        raw_vars=predictors,
         results_folder=results_folder,
         method=method,
         deseasonalise_output=deseasonalise_output,

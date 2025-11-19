@@ -2,14 +2,14 @@ import xarray as xr
 import numpy as np
 import matplotlib.pyplot as plt
 
-RECALCULATE_CORRS = False
+RECALCULATE_CORRS = True
 threshold = 0.6
 
 if RECALCULATE_CORRS:
     file_path = "data/prescriptions_02_03_0501_2010-08_2025-08_with_flags.nc"
     ds = xr.open_dataset(file_path)
-    var_names = [var for var in ds.data_vars if var.endswith("_values")]
-    plot_names = [var.split("_values")[0] for var in var_names]
+    var_names = np.sort([var for var in ds.data_vars if var.endswith("_values")])
+    plot_names = [" ".join(var.split("_values")[0].split("_")) for var in var_names]
 
     correlations = []
     corrs = np.zeros((len(var_names), len(var_names)))
@@ -38,13 +38,13 @@ else:
 
 np.save("outputs/pairwise_high_correlations.npy", correlations)
 print(f"{len(correlations)} large correlations found:")
-print("correlations = [")
+print(f"correlations > {threshold} = [")
 for i in correlations:
     print(f'"{i}",')
 print("]")
 
 fig, ax = plt.subplots(figsize=(10, 8))
-cax = ax.matshow(np.abs(corrs), cmap="Reds", vmin=0, vmax=1)
+cax = ax.matshow(corrs, cmap="bwr", vmin=-1, vmax=1)
 for i, v1 in enumerate(var_names):
     for j, v2 in enumerate(var_names):
         if np.abs(corrs[i, j]) > threshold and i != j:

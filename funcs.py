@@ -298,6 +298,116 @@ def add_particulate_flags(prescriptions_ds, particulates_ds, mass_z_thresh=1.5, 
 
     return prescriptions_ds
 
+def add_deprivation_index(prescriptions_ds, deprivation_ds):
+    """
+    Add imd_centile and imd_lad_code to prescriptions_ds by matching each
+    (date, practice_id) to the nearest LAD centroid in deprivation_ds for the
+    nearest deprivation year.
+
+    Assumes:
+      - prescriptions_ds.latitude/practices_ds.longitude are coords aligned with practice_id
+      - prescriptions_ds.date is datetime64[ns]
+      - deprivation_ds has dims (LAD_code, year) and coords:
+            deprivation_ds['latitude'] (LAD_code, year)
+            deprivation_ds['longitude'] (LAD_code, year)
+            deprivation_ds['year'] (year)
+            deprivation_ds['LAD_code'] (LAD_code)   (coordinate labels)
+        and data variable 'centile' with shape (LAD_code, year)
+    """
+
+    # deprivation data
+    dep_years = deprivation_ds["year"].values            # shape (n_dep_years,)
+    dep_lad_codes = deprivation_ds["LAD_code"].values    # shape (n_dep_lads,)
+    dep_lat_arr = deprivation_ds["latitude"].values      # shape (n_dep_lads, n_dep_years)
+    dep_lon_arr = deprivation_ds["longitude"].values     # shape (n_dep_lads, n_dep_years)
+    dep_cent_arr = deprivation_ds["centile"].values      # shape (n_dep_lads, n_dep_years)
+    n_dep_years = dep_years.shape[0]
+    n_dep_lads = dep_lad_codes.shape[0]
+
+    # practice data
+    pres_prac_lats = prescriptions_ds["latitude"].values       # shape (n_pres_prac,)
+    pres_prac_lons = prescriptions_ds["longitude"].values      # shape (n_pres_prac,)
+    pres_date_years = prescriptions_ds["date"].dt.year.values  # shape (n_pres_dates,)
+    n_pres_prac = pres_prac_lats.shape[0]
+    n_pres_dates = pres_date_years.shape[0]
+    prac_coords = np.column_stack([pres_prac_lats, pres_prac_lons])  # (n_pres_prac, 2)
+
+    # Precompute nearest LAD index (original index into LAD_code axis) for every practice x deprivation-year
+    # Initialize with -1 for "no valid LAD"
+    lad_idx_per_practice_and_year = np.full((n_pres_prac, n_dep_years), -1, dtype=int)
+
+    for j in range(n_dep_years):
+        # LAD coordinates for year j
+        lat_j = dep_lat_arr[:, j]   # shape (n_dep_lads,)
+        lon_j = dep_lon_arr[:, j]   # shape (n_dep_lads,)
+
+        valid_lad_mask = np.isfinite(lat_j) & np.isfinite(lon_j)
+        if not np.any(valid_lad_mask):
+            continue
+
+        valid_lad_indices = np.where(valid_lad_mask)[0]   # original LAD indices
+        lad_coords_j = np.column_stack([lat_j[valid_lad_mask], lon_j[valid_lad_mask]])  # (n_valid_lads, 2)
+
+        # build KDTree for this year's valid LAD centroids
+        tree = cKDTree(lad_coords_j)
+        _, idx = tree.query(prac_coords)   # idx into lad_coords_j
+
+        # map back to original LAD indices
+        original_lad_idx = valid_lad_indices[idx]  # (n_pres_prac,)
+        lad_idx_per_practice_and_year[:, j] = original_lad_idx
+
+    # find index of closest deprivation year to each prescription date year
+    # e.g. if pres_date_years = [2015, 2016, 2017, 2018, 2019]
+    # and dep_years = [2015, 2019, 2025]
+    # then [0, 0, 0, 1, 1]
+    closest_dep_year_idx_per_date = np.argmin(np.abs(pres_date_years[:, None] - dep_years[None, :]), axis=1)  # (n_pres_dates,)
+
+    # prepare output arrays
+    imd_centile = np.full((n_pres_dates, n_pres_prac), np.nan, dtype=np.float32)
+    imd_lad_code = np.full((n_pres_dates, n_pres_prac), "", dtype=object)
+    imd_lon = np.full((n_pres_dates, n_pres_prac), np.nan, dtype=np.float32)
+    imd_lat = np.full((n_pres_dates, n_pres_prac), np.nan, dtype=np.float32)
+
+    # for each deprivation year j, fill rows for dates that map to j
+    for j in range(n_dep_years):
+        date_mask = (closest_dep_year_idx_per_date == j)
+        if not np.any(date_mask):
+            continue  # no dates map to this deprivation year
+
+        # lad indices per practice for this year (original lad index or -1)
+        lad_idx_for_pracs = lad_idx_per_practice_and_year[:, j]  # shape (n_pres_prac,)
+
+        # where lad_idx_for_pracs == -1 we should keep NaN/''.
+        valid_prac_mask_for_year = lad_idx_for_pracs >= 0
+        if np.any(valid_prac_mask_for_year):
+            # centiles for those LADs at year j
+            cent_for_pracs = np.full(n_pres_prac, np.nan, dtype=np.float32)
+            lats_for_pracs = np.full(n_pres_prac, np.nan, dtype=np.float32)
+            lons_for_pracs = np.full(n_pres_prac, np.nan, dtype=np.float32)
+            ladcode_for_pracs = np.full(n_pres_prac, "", dtype=object)
+
+            valid_lad_original_idx = lad_idx_for_pracs[valid_prac_mask_for_year]  # original lad indices
+            # fetch centile values from cent_arr using advanced indexing
+            cent_for_pracs[valid_prac_mask_for_year] = dep_cent_arr[valid_lad_original_idx, j]
+            lats_for_pracs[valid_prac_mask_for_year] = dep_lat_arr[valid_lad_original_idx, j]
+            lons_for_pracs[valid_prac_mask_for_year] = dep_lon_arr[valid_lad_original_idx, j]
+            ladcode_for_pracs[valid_prac_mask_for_year] = dep_lad_codes[valid_lad_original_idx]
+
+            # assign to all dates that map to this year (broadcast over rows)
+            imd_centile[np.ix_(date_mask, np.arange(n_pres_prac))] = cent_for_pracs[None, :]
+            imd_lad_code[np.ix_(date_mask, np.arange(n_pres_prac))] = ladcode_for_pracs[None, :]
+            imd_lat[np.ix_(date_mask, np.arange(n_pres_prac))] = lats_for_pracs[None, :]
+            imd_lon[np.ix_(date_mask, np.arange(n_pres_prac))] = lons_for_pracs[None, :]
+
+    # add to prescriptions dataset
+    prescriptions_ds = prescriptions_ds.copy()
+    prescriptions_ds["imd_centile"] = (("date", "practice_id"), imd_centile)
+    prescriptions_ds["imd_lad_code"] = (("date", "practice_id"), imd_lad_code)
+    prescriptions_ds["imd_latitude"] = (("date", "practice_id"), imd_lat)
+    prescriptions_ds["imd_longitude"] = (("date", "practice_id"), imd_lon)
+
+    return prescriptions_ds
+
 # DATA HELPERS ------------------------------------------------------------------------------------
 def download_file(url, session, out_dir='', timeout=20, overwrite=False):
     """Download file streaming to disk. Skip if already exists."""
@@ -576,6 +686,21 @@ def plot_readings(ax, practice_data, flag_vars, seasonal_correction=False):
     ax.grid()
     return ax
 
+def plot_deprivation_lad_map(prescriptions_ds):
+    inds = np.random.choice(np.arange(len(prescriptions_ds["practice_id"])), size=20, replace=False)
+    colors = plt.get_cmap('tab20').colors
+    prac_lons = prescriptions_ds["longitude"].values[inds]
+    prac_lats = prescriptions_ds["latitude"].values[inds]
+    lad_lons = prescriptions_ds["imd_longitude"].values[:, inds]
+    lad_lats = prescriptions_ds["imd_latitude"].values[:, inds]
+    plt.figure(figsize=(10,10))
+    for i, ind in enumerate(inds):
+        plt.scatter(prac_lons[i], prac_lats[i], color=colors[i], label=f'Practice {ind}', marker='o', alpha=0.3)
+        plt.scatter(lad_lons[:, i], lad_lats[:, i], color=colors[i], marker='x', alpha=0.3)
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.legend()
+    plt.savefig("test.png")
 
 
 # MODELING FUNCTIONS ==============================================================================
@@ -1282,7 +1407,9 @@ def make_progress_callback(total_draws, total_tune):
 
 # ANALYSIS FUNCTIONS ==============================================================================
 def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, None), xlim_values=(None, None)):
-    """Compare individual mixed effects model analyses across prescription types.
+    """
+    Compare mixed-effects model analyses across prescription types.
+
     Parameters
     ----------
     results_folder : str
@@ -1293,186 +1420,109 @@ def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, 
         (min, max) for x-axis limits on flag plot; None for automatic, by default (None, None)
     xlim_values : tuple, optional
         (min, max) for x-axis limits on values plot; None for automatic, by default (None, None)
+
+    Produces:
+    - Combined flagged plots
+    - Combined values plots
+    - Per-variable flagged plots
+    - Per-variable values plots
     """
-    # prescription type definitions (hardcoded for now)
+    # define prescription types
     prescription_codes = ['02_03_0501', '02', '03', '0501']
     labels = ['All', 'Cardiovascular', 'Respiratory', 'Antibiotics']
     colours = ['black', 'red', 'blue', 'orange']
 
-    # =============================================================================================
-    # load the data
-
-    # set input and output paths correctly
+    # configure folders
     plot_root = f"{results_folder}"
+    os.makedirs(plot_root, exist_ok=True)
     results_folders = [f"{results_folder}{c}/" for c in prescription_codes]
 
     # load data
-    os.makedirs(plot_root, exist_ok=True)
-    data_flag = []
-    data_values = []
-    datasets = []
+    data_flag, data_values = [], []
     for folder in results_folders:
         try:
             df_flag = pd.read_csv(f"{folder}/mixed_effects_flag_results.csv")
             df_val = pd.read_csv(f"{folder}/mixed_effects_values_results.csv")
         except FileNotFoundError:
-            print(f"Warning: could not find results in {folder}, skipping...")
+            print(f"Warning: {folder} missing, skipping.")
             continue
-        # skip empty results
+
         if df_flag.empty and df_val.empty:
-            print(f"Warning: results in {folder} are empty, skipping...")
+            print(f"Warning: {folder} empty, skipping.")
             continue
+
         df_flag["dataset"] = folder
         df_val["dataset"] = folder
         data_flag.append(df_flag)
         data_values.append(df_val)
 
-    # safe concatenation: create empty DataFrames with expected columns if nothing was found
-    if data_flag:
-        df_flag_all = pd.concat(data_flag, ignore_index=True)
-    else:
-        df_flag_all = pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset"])
+    # combined dataframes for per-variable plots
+    df_flag_all = pd.concat(data_flag, ignore_index=True) if data_flag else \
+                  pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset"])
+    df_val_all = pd.concat(data_values, ignore_index=True) if data_values else \
+                 pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset"])
 
-    if data_values:
-        df_val_all = pd.concat(data_values, ignore_index=True)
-    else:
-        df_val_all = pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset"])
-
-    # =============================================================================================
-    # plot all on one figure
-
+    # combined flag and values plots --------------------------------------------------------------
     for hide_sulfur in [True, False]:
-        if not data_flag and not data_values:
-            print("No data available for plotting 'all' figure; skipping.")
-            continue
+        suffix = "_no_sulfur" if hide_sulfur else ""
 
-        # determine how many series we actually have
-        n_flag_series = len(data_flag)
-        n_val_series = len(data_values)
-        labels_flag = labels[:n_flag_series]
-        colours_flag = colours[:n_flag_series]
-        labels_val = labels[:n_val_series]
-        colours_val = colours[:n_val_series]
+        # plot for flag variables
+        plot_combined(
+            df_list=data_flag,
+            labels_list=labels[:len(data_flag)],
+            colours_list=colours[:len(data_flag)],
+            hide_sulfur=hide_sulfur,
+            outfile=f"{plot_root}/combined_flags{suffix}.png",
+            xlim=xlim_flag,
+            y_jitter=y_jitter,
+            is_values=False
+        )
 
-        # flagged + values in a 2-row figure
-        fig, axes = plt.subplots(2, 1, figsize=(10, 10), sharex=False)
+        # plot for values variables
+        plot_combined(
+            df_list=data_values,
+            labels_list=labels[:len(data_values)],
+            colours_list=colours[:len(data_values)],
+            hide_sulfur=hide_sulfur,
+            outfile=f"{plot_root}/combined_values{suffix}.png",
+            xlim=xlim_values,
+            y_jitter=y_jitter,
+            is_values=True
+        )
 
-        # flagged
-        if n_flag_series > 0:
-            last_df = None
-            for i, (df, label, color) in enumerate(zip(data_flag, labels_flag, colours_flag)):
-                if hide_sulfur:
-                    df = df[~df["name"].str.contains("aqrean_daqi_sulfur_dioxide")]
-                last_df = df
-                y_pos = np.arange(len(df["name"])) + (i - n_flag_series / 2) * y_jitter
-                axes[0].errorbar(df["coef"], y_pos,
-                                    xerr=[df["coef"] - df["ci_low"], df["ci_high"] - df["coef"]],
-                                    fmt='o', color=color, label=label, markersize=3, capsize=2)
-            if last_df is not None:
-                axes[0].set_yticks(np.arange(len(last_df["name"])))
-                axes[0].set_yticklabels(last_df["name"])
-        else:
-            axes[0].text(0.5, 0.5, 'No flagged results', ha='center', va='center')
+    # per-variable flag plots ---------------------------------------------------------------------
+    flag_vars = sorted(df_flag_all["name"].unique()) if not df_flag_all.empty else []
+    os.makedirs(f"{plot_root}/flags", exist_ok=True)
+    
+    def flag_extractor(df, var):
+        return df[df["name"] == var]
 
-        # values
-        if n_val_series > 0:
-            last_x = None
-            for i, (df, label, color) in enumerate(zip(data_values, labels_val, colours_val)):
-                x = df["name"].str.replace("_values", "")
-                last_x = x
-                y_pos = np.arange(len(df["name"])) + (i - n_val_series / 2) * y_jitter
-                axes[1].errorbar(df["coef"], y_pos,
-                                    xerr=[df["coef"] - df["ci_low"], df["ci_high"] - df["coef"]],
-                                    fmt='o', color=color, label=label, markersize=3, capsize=2)
-            if last_x is not None:
-                axes[1].set_yticks(np.arange(len(last_x)))
-                axes[1].set_yticklabels(last_x)
-        else:
-            axes[1].text(0.5, 0.5, 'No values results', ha='center', va='center')
+    for var in flag_vars:
+        plot_variable(
+            var=var,
+            dataframes=data_flag,
+            labels=labels,
+            colours=colours,
+            var_extractor=flag_extractor,
+            outpath=f"{plot_root}/flags/{var}.png"
+        )
 
-        # plot formatting
-        for ax in axes:
-            ax.axvline(0, color='black', lw=0.8)
-            ax.grid(True, linestyle=':', alpha=0.6)
-        axes[0].set_xlim(xlim_flag)
-        axes[1].set_xlim(xlim_values)
-        axes[0].set_title("Flagged models")
-        axes[1].set_title("Values models")
-        axes[1].set_xlabel("Coefficient estimate")
-        plt.tight_layout()
-        
-        # shared legend
-        handles, labels_ = axes[0].get_legend_handles_labels()
-        fig.legend(handles, labels_, loc='lower center', ncol=4, frameon=False)
-        fig.subplots_adjust(bottom=0.09)
+    # per-variable values plots -------------------------------------------------------------------
+    val_vars = sorted(df_val_all["name"].str.replace("_values", "").unique()) if not df_val_all.empty else []
+    os.makedirs(f"{plot_root}/values", exist_ok=True)
 
-        if hide_sulfur:
-            plt.savefig(f"{plot_root}mixed_no_sulfur.png", dpi=300)
-        else:
-            plt.savefig(f"{plot_root}mixed.png", dpi=300)
-        plt.close(fig)
+    def values_extractor(df, var):
+        return df[df["name"].str.replace("_values", "") == var]
 
-
-    # =============================================================================================
-    # plot coefficient estimates for flagged variables individually (comparing datasets)
-
-    # if there are no flagged results, skip the per-variable flagged plots
-    if df_flag_all.empty:
-        print("No per-practice flagged results found; skipping flag variable plots.")
-        flag_varnames = []
-    else:
-        flag_varnames = sorted(df_flag_all["name"].unique())
-    os.makedirs(f"{plot_root}flags", exist_ok=True)
-    for var in flag_varnames:
-        fig, ax = plt.subplots(figsize=(6, 4))
-        matched = False
-        for df, label, color in zip(data_flag, labels, colours):
-            sub = df[df["name"] == var]
-            if not sub.empty:
-                ax.errorbar(sub["coef"], label,
-                            xerr=[sub["coef"] - sub["ci_low"], sub["ci_high"] - sub["coef"]],
-                            fmt='o', color=color, markersize=5, capsize=4)
-                matched = True
-        if not matched:
-            plt.close(fig)
-            continue
-        ax.axvline(0, color='black', lw=0.8)
-        ax.grid(True, linestyle=':', alpha=0.6)
-        ax.set_title(f"{var}")
-        ax.set_xlabel("Coefficient estimate")
-        fig.tight_layout()
-        plt.savefig(f"{plot_root}flags/{var}.png", dpi=300)
-        plt.close(fig)
-
-    # =============================================================================================
-    # plot coefficient estimates for values variables individually (comparing datasets)
-
-    if df_val_all.empty:
-        print("No values results found; skipping value variable plots.")
-        val_varnames = []
-    else:
-        val_varnames = sorted(df_val_all["name"].str.replace("_values", "").unique())
-    os.makedirs(f"{plot_root}values", exist_ok=True)
-    for var in val_varnames:
-        fig, ax = plt.subplots(figsize=(6, 4))
-        matched = False
-        for df, label, color in zip(data_values, labels, colours):
-            sub = df[df["name"].str.replace("_values", "") == var]
-            if not sub.empty:
-                ax.errorbar(sub["coef"], label,
-                            xerr=[sub["coef"] - sub["ci_low"], sub["ci_high"] - sub["coef"]],
-                            fmt='o', color=color, markersize=5, capsize=4)
-                matched = True
-        if not matched:
-            plt.close(fig)
-            continue
-        ax.axvline(0, color='black', lw=0.8)
-        ax.grid(True, linestyle=':', alpha=0.6)
-        ax.set_title(f"{var}")
-        ax.set_xlabel("Coefficient estimate")
-        fig.tight_layout()
-        plt.savefig(f"{plot_root}values/{var}.png", dpi=300)
-        plt.close(fig)
+    for var in val_vars:
+        plot_variable(
+            var=var,
+            dataframes=data_values,
+            labels=labels,
+            colours=colours,
+            var_extractor=values_extractor,
+            outpath=f"{plot_root}/values/{var}.png"
+        )
 
 def compare_bayesian_analyses(results_folder, y_jitter=0.15, generate_arviz_plots=True):
     '''Generates plots to compare the Bayesian analysis results across different prescription types.
@@ -1491,35 +1541,14 @@ def compare_bayesian_analyses(results_folder, y_jitter=0.15, generate_arviz_plot
     labels = ['All', 'Cardiovascular', 'Respiratory', 'Antibiotics']
     colours = ['black', 'red', 'blue', 'orange']
 
-    # fields in the analysis
-    value_vars = [
-        "hydro_rain",
-        "met_rain",
-        "met_tmax",
-        "aqrean_carbon_monoxide",
-        "aqrean_daqi_overall",
-        "aqrean_nitrogen_monoxide",
-        "aqrean_nitrogen_dioxide",
-        "aqrean_daqi_nitrogen_dioxide",
-        "aqrean_nox_expressed_as_nitrogen_dioxide",
-        "aqrean_ozone",
-        "aqrean_daqi_ozone",
-        "aqrean_pm2p5",
-        "aqrean_pm10",
-        "aqrean_daqi_pm10",
-        "aqrean_sulfur_dioxide",
-        "aqrean_daqi_sulfur_dioxide"
-    ]
-    value_vars = [ft + "_values" for ft in value_vars]
-
     # set input and output paths correctly
     results_roots = [
         f"{results_folder}{c}/" for c in prescription_codes
     ]
-    plot_root = f"{results_folder}"
+    plot_root = results_folder
 
     # load data
-    idatas = []
+    value_vars = None
     dataframes = []
     for root in results_roots:
         csv_path = root + f"bayesian_model_summary.csv"
@@ -1532,14 +1561,16 @@ def compare_bayesian_analyses(results_folder, y_jitter=0.15, generate_arviz_plot
             continue
         df = df.rename(columns={"Unnamed: 0": "name"})
         dataframes.append(df)
+        # find variables to plot for
+        if value_vars is None:
+            value_vars = [v for v in df["name"]
+                          if not any(x in v for x in ["|", "month", "Intercept", "sigma"])]
 
     if not dataframes:
         raise FileNotFoundError("No Bayesian results CSVs found — nothing to plot.")
 
-    # =================================================================================================
-    # all in one figure
-
-    fig, ax = plt.subplots(figsize=(10, 8))
+    # combined plot -------------------------------------------------------------------------------
+    plt.figure(figsize=(10, 8))
     for i, (df, label, color) in enumerate(zip(dataframes, labels, colours)):
         if df.empty:  # skip missing ones
             continue
@@ -1550,67 +1581,48 @@ def compare_bayesian_analyses(results_folder, y_jitter=0.15, generate_arviz_plot
 
         # set jitter position and plot
         y_pos = np.arange(len(value_vars)) + (i - len(dataframes) / 2) * y_jitter
-        ax.errorbar(
+        plt.errorbar(
             df["mean"], y_pos,
             xerr=[df["mean"] - df["hdi_3%"], df["hdi_97%"] - df["mean"]],
             fmt='o', color=color, label=label, markersize=4, capsize=3
         )
 
     # plot formatting
-    ax.axvline(0, color='black', lw=0.8)
-    ax.set_yticks(np.arange(len(value_vars)))
-    ax.set_yticklabels(value_vars)
-    ax.grid(True, linestyle=':', alpha=0.6)
-    ax.set_xlabel("Posterior mean (effect size)")
-    ax.set_title("Bayesian model coefficients comparison")
+    var_names = [" ".join(v.replace("_values", "").split("_")) for v in value_vars]
+    plt.axvline(0, color='black', alpha=0.8)
+    plt.yticks(np.arange(len(value_vars)), var_names)
+    plt.grid(alpha=0.8)
+    plt.legend()
+    plt.xlabel("Posterior mean (effect size)")
+    plt.title("Bayesian model coefficients")
     plt.tight_layout()
-    
-    # shared legend
-    handles, labels_ = ax.get_legend_handles_labels()
-    fig.legend(handles, labels_, loc='lower center', ncol=4, frameon=False)
-    fig.subplots_adjust(bottom=0.09)
     plt.savefig(plot_root + f"bayesian.png", dpi=300)
     plt.close(fig='all')
+    print(f"Combined plot saved to {plot_root}bayesian.png")
 
-    # =================================================================================================
-    # individual variable plots
-
+    # per-variable plots --------------------------------------------------------------------------
     plot_folder = f"{plot_root}values_bayes/"
     os.makedirs(plot_folder, exist_ok=True)
+
+    def bayes_extractor(df, var):
+        return df[df["name"] == var]
+
     for var in value_vars:
-        fig, ax = plt.subplots(figsize=(6, 4))
-        matched = False
-        for df, label, color in zip(dataframes, labels, colours):
-            if df.empty:  # skip missing ones
-                continue
+        plot_variable(
+            var=var,
+            dataframes=dataframes,
+            labels=labels,
+            colours=colours,
+            var_extractor=bayes_extractor,
+            outpath=f"{plot_folder}{var}.png",
+            col_est="mean",
+            col_low="hdi_3%",
+            col_high="hdi_97%",
+        )
 
-            # extract var and plot
-            sub = df[df["name"] == var]
-            if not sub.empty:
-                ax.errorbar(
-                    sub["mean"], label,
-                    xerr=[sub["mean"] - sub["hdi_3%"], sub["hdi_97%"] - sub["mean"]],
-                    fmt='o', color=color, markersize=5, capsize=4
-                )
-                matched = True
-        if not matched:
-            plt.close(fig='all')
-            continue
+    print(f"Per-variable plots saved to {plot_folder}")
 
-        # plot formatting and save
-        ax.axvline(0, color='black', lw=0.8)
-        ax.grid(True, linestyle=':', alpha=0.6)
-        ax.set_title(f"{var}")
-        ax.set_xlabel("Posterior mean (effect size)")
-        fig.tight_layout()
-        plt.savefig(f"{plot_folder}{var}.png", dpi=300)
-        plt.close(fig='all')
-
-    print(f"Plots saved to {plot_root}")
-
-    # =================================================================================================
-    # generate ArviZ diagnostic plots for each model
-
+    # arviz diagnostic plots ----------------------------------------------------------------------
     if generate_arviz_plots:
         az.rcParams["plot.max_subplots"] = 40
         for root in results_roots:
@@ -1777,14 +1789,15 @@ def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15
                 y_pos = np.arange(n_categories) + y_jitter*(i - (len(prescription_codes)-1)/2)
                 ax.errorbar(y_pos, means, yerr=[means - lows, highs - means],
                             fmt='o', color=color, label=pres_code)
-                ax.axhline(0, color='k', linestyle='--', zorder=0)
+                ax.axhline(0, color='black', alpha=0.8, zorder=-1)
                 ax.set_xticks(np.arange(n_categories))
                 ax.set_xticklabels([str(c) for c in categories])
 
-        ax.set_title(f"{var} posterior effect")
+        var_str = var.replace("_values", "").replace("_", " ")
+        ax.set_title(f"{var_str} posterior effect")
         ax.set_ylabel("Effect on items")
-        ax.set_xlabel(var if var in spline_vars else "Level")
-        ax.grid(True, linestyle=":", alpha=0.6)
+        ax.set_xlabel(var_str)
+        ax.grid(alpha=0.8, zorder=-2)
         ax.legend(frameon=False)
         plt.tight_layout()
 
@@ -1794,6 +1807,144 @@ def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15
         plt.close(fig)
 
     print(f"All spline and categorical plots saved to {out_dir}")
+
+# ANALYSIS HELPERS --------------------------------------------------------------------------------
+def plot_combined(
+    df_list,
+    labels_list,
+    colours_list,
+    hide_sulfur,
+    outfile,
+    xlim,
+    y_jitter,
+    is_values=False
+):
+    """
+    Plot a combined figure for either flagged or values mixed-effects models.
+
+    Parameters
+    ----------
+    df_list : list of DataFrame
+        List of model results (flag or value) for each prescription type.
+    labels_list : list of str
+        Labels for each prescription type.
+    colours_list : list of str
+        Colours for each prescription type.
+    hide_sulfur : bool
+        Whether to omit sulfur dioxide variables.
+    outfile : str
+        Output file path.
+    xlim : tuple
+        (min, max) X-axis limits.
+    y_jitter : float
+        Vertical jitter spacing between categories.
+    is_values : bool, optional
+        Whether the dataset contains `_values` suffix on variable names.
+    """
+    if not df_list:
+        print(f"No data for {outfile}, skipping.")
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    final_varnames = []  # updated after last valid df
+
+    for i, (df, label, colour) in enumerate(zip(df_list, labels_list, colours_list)):
+        df_plot = df.copy()
+
+        if hide_sulfur:
+            df_plot = df_plot[~df_plot["name"].str.contains("aqrean_daqi_sulfur_dioxide")]
+
+        if df_plot.empty:
+            continue
+
+        # Adjust names for value models
+        varnames = df_plot["name"].str.replace("_values", "") if is_values else df_plot["name"]
+        final_varnames = varnames.tolist()
+
+        y_positions = np.arange(len(df_plot)) + (i - len(df_list)/2) * y_jitter
+
+        ax.errorbar(
+            df_plot["coef"], y_positions,
+            xerr=[df_plot["coef"] - df_plot["ci_low"], df_plot["ci_high"] - df_plot["coef"]],
+            fmt='o', color=colour, label=label, markersize=4, capsize=3
+        )
+
+    if final_varnames:
+        ax.set_yticks(np.arange(len(final_varnames)))
+        ax.set_yticklabels(final_varnames)
+
+    ax.axvline(0, color='black', alpha=0.8, zorder=-1)
+    ax.grid(alpha=0.8, zorder=-2)
+    ax.set_xlim(xlim)
+
+    ax.set_title("Values models" if is_values else "Flagged models")
+    ax.set_xlabel("Coefficient estimate")
+
+    handles, lbls = ax.get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, lbls, loc='lower center', ncol=4, frameon=False)
+        fig.subplots_adjust(bottom=0.12)
+
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=300)
+    plt.close(fig)
+
+def plot_variable(
+        var,
+        dataframes, labels, colours,
+        var_extractor,
+        outpath,
+        col_est="coef",
+        col_low="ci_low",
+        col_high="ci_high",
+        figsize=(6, 4)
+):
+    """
+    Generic helper for making per-variable coefficient/mean plots.
+    Works with frequentist and Bayesian summaries.
+
+    Parameters
+    ----------
+    var : str
+        Variable name to plot.
+    dataframes : list
+        List of dataframes containing summary statistics.
+    labels, colours : lists
+        Matching labels/colours for each dataframe.
+    var_extractor : callable
+        Function(df, var) -> subset dataframe containing rows for this variable.
+    outpath : str
+        Location to save plot.
+    col_est : str
+        Column name for the estimate (coef/mean).
+    col_low, col_high : str
+        Column names for the lower and upper interval bounds.
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    matched = False
+
+    for df, label, colour in zip(dataframes, labels, colours):
+        sub = var_extractor(df, var)
+        if not sub.empty:
+            ax.errorbar(
+                sub[col_est], label,
+                xerr=[sub[col_est] - sub[col_low], sub[col_high] - sub[col_est]],
+                fmt="o", color=colour, markersize=5, capsize=4,
+            )
+            matched = True
+
+    if not matched:
+        plt.close(fig)
+        return
+
+    ax.axvline(0, color="black", alpha=0.8)
+    ax.grid(alpha=0.8, zorder=-2)
+    ax.set_title(var)
+    ax.set_xlabel("Effect estimate")
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=300)
+    plt.close(fig)
 
 
 
@@ -2245,3 +2396,196 @@ def run_bayesian_model_old(
     status(f"Model results saved to: {idata_path}")
 
     return model, idata
+
+def compare_individual_analyses_old(results_folder, y_jitter=0.15, xlim_flag=(None, None), xlim_values=(None, None)):
+    """Compare individual mixed effects model analyses across prescription types.
+    Parameters
+    ----------
+    results_folder : str
+        Root folder where results are stored.
+    y_jitter : float, optional
+        Amount to jitter y-axis for visibility on combined plots, by default 0.15
+    xlim_flag : tuple, optional
+        (min, max) for x-axis limits on flag plot; None for automatic, by default (None, None)
+    xlim_values : tuple, optional
+        (min, max) for x-axis limits on values plot; None for automatic, by default (None, None)
+    """
+    # prescription type definitions (hardcoded for now)
+    prescription_codes = ['02_03_0501', '02', '03', '0501']
+    labels = ['All', 'Cardiovascular', 'Respiratory', 'Antibiotics']
+    colours = ['black', 'red', 'blue', 'orange']
+
+    # =============================================================================================
+    # load the data
+
+    # set input and output paths correctly
+    plot_root = f"{results_folder}"
+    results_folders = [f"{results_folder}{c}/" for c in prescription_codes]
+
+    # load data
+    os.makedirs(plot_root, exist_ok=True)
+    data_flag = []
+    data_values = []
+    datasets = []
+    for folder in results_folders:
+        try:
+            df_flag = pd.read_csv(f"{folder}/mixed_effects_flag_results.csv")
+            df_val = pd.read_csv(f"{folder}/mixed_effects_values_results.csv")
+        except FileNotFoundError:
+            print(f"Warning: could not find results in {folder}, skipping...")
+            continue
+        # skip empty results
+        if df_flag.empty and df_val.empty:
+            print(f"Warning: results in {folder} are empty, skipping...")
+            continue
+        df_flag["dataset"] = folder
+        df_val["dataset"] = folder
+        data_flag.append(df_flag)
+        data_values.append(df_val)
+
+    # safe concatenation: create empty DataFrames with expected columns if nothing was found
+    if data_flag:
+        df_flag_all = pd.concat(data_flag, ignore_index=True)
+    else:
+        df_flag_all = pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset"])
+
+    if data_values:
+        df_val_all = pd.concat(data_values, ignore_index=True)
+    else:
+        df_val_all = pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset"])
+
+    # =============================================================================================
+    # plot all on one figure
+
+    for hide_sulfur in [True, False]:
+        if not data_flag and not data_values:
+            print("No data available for plotting 'all' figure; skipping.")
+            continue
+
+        # determine how many series we actually have
+        n_flag_series = len(data_flag)
+        n_val_series = len(data_values)
+        labels_flag = labels[:n_flag_series]
+        colours_flag = colours[:n_flag_series]
+        labels_val = labels[:n_val_series]
+        colours_val = colours[:n_val_series]
+
+        # flagged + values in a 2-row figure
+        fig, axes = plt.subplots(2, 1, figsize=(10, 10), sharex=False)
+
+        # flagged
+        if n_flag_series > 0:
+            last_df = None
+            for i, (df, label, color) in enumerate(zip(data_flag, labels_flag, colours_flag)):
+                if hide_sulfur:
+                    df = df[~df["name"].str.contains("aqrean_daqi_sulfur_dioxide")]
+                last_df = df
+                y_pos = np.arange(len(df["name"])) + (i - n_flag_series / 2) * y_jitter
+                axes[0].errorbar(df["coef"], y_pos,
+                                    xerr=[df["coef"] - df["ci_low"], df["ci_high"] - df["coef"]],
+                                    fmt='o', color=color, label=label, markersize=3, capsize=2)
+            if last_df is not None:
+                axes[0].set_yticks(np.arange(len(last_df["name"])))
+                axes[0].set_yticklabels(last_df["name"])
+        else:
+            axes[0].text(0.5, 0.5, 'No flagged results', ha='center', va='center')
+
+        # values
+        if n_val_series > 0:
+            last_x = None
+            for i, (df, label, color) in enumerate(zip(data_values, labels_val, colours_val)):
+                x = df["name"].str.replace("_values", "")
+                last_x = x
+                y_pos = np.arange(len(df["name"])) + (i - n_val_series / 2) * y_jitter
+                axes[1].errorbar(df["coef"], y_pos,
+                                    xerr=[df["coef"] - df["ci_low"], df["ci_high"] - df["coef"]],
+                                    fmt='o', color=color, label=label, markersize=3, capsize=2)
+            if last_x is not None:
+                axes[1].set_yticks(np.arange(len(last_x)))
+                axes[1].set_yticklabels(last_x)
+        else:
+            axes[1].text(0.5, 0.5, 'No values results', ha='center', va='center')
+
+        # plot formatting
+        for ax in axes:
+            ax.axvline(0, color='black', alpha=0.8, zorder=-1)
+            ax.grid(alpha=0.8, zorder=-2)
+        axes[0].set_xlim(xlim_flag)
+        axes[1].set_xlim(xlim_values)
+        axes[0].set_title("Flagged models")
+        axes[1].set_title("Values models")
+        axes[1].set_xlabel("Coefficient estimate")
+        plt.tight_layout()
+        
+        # shared legend
+        handles, labels_ = axes[0].get_legend_handles_labels()
+        fig.legend(handles, labels_, loc='lower center', ncol=4, frameon=False)
+        fig.subplots_adjust(bottom=0.09)
+
+        if hide_sulfur:
+            plt.savefig(f"{plot_root}mixed_no_sulfur.png", dpi=300)
+        else:
+            plt.savefig(f"{plot_root}mixed.png", dpi=300)
+        plt.close(fig)
+
+
+    # =============================================================================================
+    # plot coefficient estimates for flagged variables individually (comparing datasets)
+
+    # if there are no flagged results, skip the per-variable flagged plots
+    if df_flag_all.empty:
+        print("No per-practice flagged results found; skipping flag variable plots.")
+        flag_varnames = []
+    else:
+        flag_varnames = sorted(df_flag_all["name"].unique())
+    os.makedirs(f"{plot_root}flags", exist_ok=True)
+    for var in flag_varnames:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        matched = False
+        for df, label, color in zip(data_flag, labels, colours):
+            sub = df[df["name"] == var]
+            if not sub.empty:
+                ax.errorbar(sub["coef"], label,
+                            xerr=[sub["coef"] - sub["ci_low"], sub["ci_high"] - sub["coef"]],
+                            fmt='o', color=color, markersize=5, capsize=4)
+                matched = True
+        if not matched:
+            plt.close(fig)
+            continue
+        ax.axvline(0, color='black', alpha=0.8, zorder=-1)
+        ax.grid(alpha=0.8, zorder=-2)
+        ax.set_title(f"{var}")
+        ax.set_xlabel("Coefficient estimate")
+        fig.tight_layout()
+        plt.savefig(f"{plot_root}flags/{var}.png", dpi=300)
+        plt.close(fig)
+
+    # =============================================================================================
+    # plot coefficient estimates for values variables individually (comparing datasets)
+
+    if df_val_all.empty:
+        print("No values results found; skipping value variable plots.")
+        val_varnames = []
+    else:
+        val_varnames = sorted(df_val_all["name"].str.replace("_values", "").unique())
+    os.makedirs(f"{plot_root}values", exist_ok=True)
+    for var in val_varnames:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        matched = False
+        for df, label, color in zip(data_values, labels, colours):
+            sub = df[df["name"].str.replace("_values", "") == var]
+            if not sub.empty:
+                ax.errorbar(sub["coef"], label,
+                            xerr=[sub["coef"] - sub["ci_low"], sub["ci_high"] - sub["coef"]],
+                            fmt='o', color=color, markersize=5, capsize=4)
+                matched = True
+        if not matched:
+            plt.close(fig)
+            continue
+        ax.axvline(0, color='black', alpha=0.8, zorder=-1)
+        ax.grid(alpha=0.8, zorder=-2)
+        ax.set_title(f"{var}")
+        ax.set_xlabel("Coefficient estimate")
+        fig.tight_layout()
+        plt.savefig(f"{plot_root}values/{var}.png", dpi=300)
+        plt.close(fig)
