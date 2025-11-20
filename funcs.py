@@ -1472,7 +1472,7 @@ def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, 
             labels_list=labels[:len(data_flag)],
             colours_list=colours[:len(data_flag)],
             hide_sulfur=hide_sulfur,
-            outfile=f"{plot_root}/combined_flags{suffix}.png",
+            outfile=f"{plot_root}/mixed_flags{suffix}.png",
             xlim=xlim_flag,
             y_jitter=y_jitter,
             is_values=False
@@ -1484,7 +1484,7 @@ def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, 
             labels_list=labels[:len(data_values)],
             colours_list=colours[:len(data_values)],
             hide_sulfur=hide_sulfur,
-            outfile=f"{plot_root}/combined_values{suffix}.png",
+            outfile=f"{plot_root}/mixed_values{suffix}.png",
             xlim=xlim_values,
             y_jitter=y_jitter,
             is_values=True
@@ -1524,7 +1524,7 @@ def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, 
             outpath=f"{plot_root}/values/{var}.png"
         )
 
-def compare_bayesian_analyses(results_folder, y_jitter=0.15, generate_arviz_plots=True):
+def compare_bayesian_analyses(results_folder, y_jitter=0.15):
     '''Generates plots to compare the Bayesian analysis results across different prescription types.
 
     Parameters
@@ -1533,8 +1533,6 @@ def compare_bayesian_analyses(results_folder, y_jitter=0.15, generate_arviz_plot
         Root folder containing results subfolders for each prescription type.
     y_jitter : float, optional
         Vertical jitter amount between overlapping categories in the combined plot.
-    generate_arviz_plots : bool, optional
-        Whether to generate ArviZ diagnostic plots for each model.
     '''
     # prescription type definitions (hardcoded for now)
     prescription_codes = ['02_03_0501', '02', '03', '0501']
@@ -1551,23 +1549,30 @@ def compare_bayesian_analyses(results_folder, y_jitter=0.15, generate_arviz_plot
     value_vars = None
     dataframes = []
     for root in results_roots:
-        csv_path = root + f"bayesian_model_summary.csv"
-        if not os.path.exists(csv_path):
-            print(f"Warning: could not find results at {csv_path}, skipping...")
+        nc_path = root + f"bayesian_model_idata.nc"
+        if not os.path.exists(nc_path):
+            print(f"Warning: could not find results at {nc_path}, skipping...")
             continue
-        df = pd.read_csv(csv_path)
+
+        # load inference data and extract 95% HDIs
+        idata = az.from_netcdf(nc_path)
+        summary = az.summary(idata, hdi_prob=0.95)
+
+        # clean and prepare dataframe
+        df = summary.reset_index().rename(columns={"index": "name"})
         if df.empty:
-            print(f"Warning: results in {csv_path} are empty, skipping...")
+            print(f"Warning: results in {nc_path} are empty, skipping...")
             continue
-        df = df.rename(columns={"Unnamed: 0": "name"})
+
         dataframes.append(df)
+
         # find variables to plot for
         if value_vars is None:
             value_vars = [v for v in df["name"]
                           if not any(x in v for x in ["|", "month", "Intercept", "sigma"])]
 
     if not dataframes:
-        raise FileNotFoundError("No Bayesian results CSVs found — nothing to plot.")
+        raise FileNotFoundError("No Bayesian results (.nc) found — nothing to plot.")
 
     # combined plot -------------------------------------------------------------------------------
     plt.figure(figsize=(10, 8))
@@ -1583,7 +1588,7 @@ def compare_bayesian_analyses(results_folder, y_jitter=0.15, generate_arviz_plot
         y_pos = np.arange(len(value_vars)) + (i - len(dataframes) / 2) * y_jitter
         plt.errorbar(
             df["mean"], y_pos,
-            xerr=[df["mean"] - df["hdi_3%"], df["hdi_97%"] - df["mean"]],
+            xerr=[df["mean"] - df["hdi_2.5%"], df["hdi_97.5%"] - df["mean"]],
             fmt='o', color=color, label=label, markersize=4, capsize=3
         )
 
@@ -1616,61 +1621,61 @@ def compare_bayesian_analyses(results_folder, y_jitter=0.15, generate_arviz_plot
             var_extractor=bayes_extractor,
             outpath=f"{plot_folder}{var}.png",
             col_est="mean",
-            col_low="hdi_3%",
-            col_high="hdi_97%",
+            col_low="hdi_2.5%",
+            col_high="hdi_97.5%",
         )
 
     print(f"Per-variable plots saved to {plot_folder}")
 
-    # arviz diagnostic plots ----------------------------------------------------------------------
-    if generate_arviz_plots:
-        az.rcParams["plot.max_subplots"] = 40
-        for root in results_roots:
-            # get the inference data
-            nc_path = os.path.join(root, f"bayesian_model_idata.nc")
-            if not os.path.exists(nc_path):
-                print(f"Warning: no netCDF file found for at {nc_path}, skipping...")
-                continue
-            idata = az.from_netcdf(nc_path)
-            arviz_out_dir = root + f"bayesian_diagnostics/"
-            os.makedirs(arviz_out_dir, exist_ok=True)
-            posterior_vars = [v for v in idata.posterior.data_vars
-                            if "|" not in v and "C(" not in v]
+def generate_bayesian_diagnostics(results_root, prescription_codes=['02_03_0501', '02', '03', '0501']):
+    results_folders = [f"{results_root}{c}/" for c in prescription_codes]
+    az.rcParams["plot.max_subplots"] = 40
+    for folder in results_folders:
+        # get the inference data
+        nc_path = os.path.join(folder, f"bayesian_model_idata.nc")
+        if not os.path.exists(nc_path):
+            print(f"Warning: no netCDF file found for at {nc_path}, skipping...")
+            continue
+        idata = az.from_netcdf(nc_path)
+        arviz_out_dir = folder + f"bayesian_diagnostics/"
+        os.makedirs(arviz_out_dir, exist_ok=True)
+        posterior_vars = [v for v in idata.posterior.data_vars
+                        if "|" not in v and "C(" not in v]
 
-            # convergence plot
-            fig = az.plot_trace(idata, var_names=posterior_vars)
+        # convergence plot
+        fig = az.plot_trace(idata, var_names=posterior_vars)
+        plt.tight_layout()
+        plt.savefig(os.path.join(arviz_out_dir, "convergence.png"), dpi=200)
+        plt.close(fig='all')
+
+        # posterior plot
+        fig = az.plot_posterior(
+            idata,
+            var_names=posterior_vars,
+            hdi_prob=0.94,
+            point_estimate="mean",
+            kind="hist",
+        )
+        plt.tight_layout()
+        plt.savefig(os.path.join(arviz_out_dir, "posterior.png"), dpi=200)
+        plt.close(fig='all')
+
+        # rank plots
+        fig = az.plot_rank(idata, var_names=posterior_vars)
+        plt.tight_layout()
+        plt.savefig(os.path.join(arviz_out_dir, "rank.png"), dpi=200)
+        plt.close(fig='all')
+
+        # posterior predictive checks
+        if "posterior_predictive" in idata.groups():
+            fig = az.plot_ppc(idata, num_pp_samples=100)
             plt.tight_layout()
-            plt.savefig(os.path.join(arviz_out_dir, "convergence.png"), dpi=200)
+            plt.savefig(os.path.join(arviz_out_dir, "ppc.png"), dpi=200)
             plt.close(fig='all')
-
-            # posterior plot
-            fig = az.plot_posterior(
-                idata,
-                var_names=posterior_vars,
-                hdi_prob=0.94,
-                point_estimate="mean",
-                kind="hist",
-            )
-            plt.tight_layout()
-            plt.savefig(os.path.join(arviz_out_dir, "posterior.png"), dpi=200)
-            plt.close(fig='all')
-
-            # rank plots
-            fig = az.plot_rank(idata, var_names=posterior_vars)
-            plt.tight_layout()
-            plt.savefig(os.path.join(arviz_out_dir, "rank.png"), dpi=200)
-            plt.close(fig='all')
-
-            # posterior predictive checks
-            if "posterior_predictive" in idata.groups():
-                fig = az.plot_ppc(idata, num_pp_samples=100)
-                plt.tight_layout()
-                plt.savefig(os.path.join(arviz_out_dir, "ppc.png"), dpi=200)
-                plt.close(fig='all')
-            else:
-                print(f"Warning: no posterior predictive data foundin {nc_path}, skipping PPC.")
-            
-            print(f"Analysis diagnostic plots saved to {arviz_out_dir}")
+        else:
+            print(f"Warning: no posterior predictive data foundin {nc_path}, skipping PPC.")
+        
+        print(f"Analysis diagnostic plots saved to {arviz_out_dir}")
 
 def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15):
     """
@@ -1763,7 +1768,7 @@ def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15
                 samples = idata.posterior[var_idata].stack(samples=("chain", "draw")).values
                 effects = samples.T @ X_grid.T
                 mean_effect = effects.mean(axis=0)
-                hdi_low, hdi_high = np.percentile(effects, [3, 97], axis=0)
+                hdi_low, hdi_high = np.percentile(effects, [2.5, 97.5], axis=0)
                 ax.plot(x, mean_effect, color=color, label=pres_code)
                 ax.fill_between(x, hdi_low, hdi_high, color=color, alpha=0.3)
 
@@ -1778,8 +1783,8 @@ def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15
 
                 # calculate stats for plotting
                 means = np.mean(vals, axis=(0,1))
-                lows = np.percentile(vals, 3, axis=(0,1))
-                highs = np.percentile(vals, 97, axis=(0,1))
+                lows = np.percentile(vals, 2.5, axis=(0,1))
+                highs = np.percentile(vals, 97.5, axis=(0,1))
 
                 # extract categories
                 categories = idata.posterior[var_idata].coords[f'C({var})_dim'].values
@@ -1793,8 +1798,7 @@ def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15
                 ax.set_xticks(np.arange(n_categories))
                 ax.set_xticklabels([str(c) for c in categories])
 
-        var_str = var.replace("_values", "").replace("_", " ")
-        ax.set_title(f"{var_str} posterior effect")
+        var_str = var_name_to_plot_name(var)
         ax.set_ylabel("Effect on items")
         ax.set_xlabel(var_str)
         ax.grid(alpha=0.8, zorder=-2)
@@ -1845,31 +1849,64 @@ def plot_combined(
         print(f"No data for {outfile}, skipping.")
         return
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    # identify variables that have non-NaN estimates in at least one dataset
+    all_names = []
+    for df in df_list:
+        df_temp = df.copy()
+        if hide_sulfur:
+            df_temp = df_temp[~df_temp["name"].str.contains("aqrean_daqi_sulfur_dioxide")]
+        all_names.extend(df_temp["name"].unique())
+    all_names = sorted(set(all_names))
 
-    final_varnames = []  # updated after last valid df
+    # drop variables that are NaN across all datasets
+    valid_names = []
+    nan_excluded = []
+    for name in all_names:
+        any_non_nan = any(
+            df.loc[df["name"] == name, "coef"].notna().any()
+            for df in df_list
+        )
+        if any_non_nan:
+            valid_names.append(name)
+        else:
+            nan_excluded.append(name)
+
+    # warn if any variables were excluded
+    if nan_excluded:
+        pretty = [var_name_to_plot_name(n) for n in nan_excluded]
+        print(f"Warning: excluding variables with all-NaN results: {pretty}")
+
+    # final list of variable names to plot (pretty names)
+    final_varnames = sorted((var_name_to_plot_name(n) for n in valid_names), reverse=True)
+    name_to_idx = {name: j for j, name in enumerate(final_varnames)}
+
+    fig, ax = plt.subplots(figsize=(10, 6))
 
     for i, (df, label, colour) in enumerate(zip(df_list, labels_list, colours_list)):
         df_plot = df.copy()
-
         if hide_sulfur:
             df_plot = df_plot[~df_plot["name"].str.contains("aqrean_daqi_sulfur_dioxide")]
-
         if df_plot.empty:
             continue
 
-        # Adjust names for value models
-        varnames = df_plot["name"].str.replace("_values", "") if is_values else df_plot["name"]
-        final_varnames = varnames.tolist()
+        # names for plotting
+        varnames = df_plot["name"].apply(var_name_to_plot_name)
 
-        y_positions = np.arange(len(df_plot)) + (i - len(df_list)/2) * y_jitter
+        # re-order dataframe to alphabetical varnames
+        df_plot["plot_name"] = varnames
+        df_plot = df_plot[df_plot["plot_name"].isin(final_varnames)].copy()
+        df_plot["idx"] = df_plot["plot_name"].map(name_to_idx)
+        df_plot = df_plot.sort_values("idx")
+        y_positions = df_plot["idx"].values + (i - len(df_list)/2) * y_jitter
 
+        # plot
         ax.errorbar(
             df_plot["coef"], y_positions,
             xerr=[df_plot["coef"] - df_plot["ci_low"], df_plot["ci_high"] - df_plot["coef"]],
             fmt='o', color=colour, label=label, markersize=4, capsize=3
         )
 
+    # y-axis labels
     if final_varnames:
         ax.set_yticks(np.arange(len(final_varnames)))
         ax.set_yticklabels(final_varnames)
@@ -1877,17 +1914,22 @@ def plot_combined(
     ax.axvline(0, color='black', alpha=0.8, zorder=-1)
     ax.grid(alpha=0.8, zorder=-2)
     ax.set_xlim(xlim)
-
-    ax.set_title("Values models" if is_values else "Flagged models")
     ax.set_xlabel("Coefficient estimate")
+    plt.tight_layout()
 
     handles, lbls = ax.get_legend_handles_labels()
+    if is_values:
+        leg_shift = 0.66
+    else:
+        leg_shift = 0.71
     if handles:
-        fig.legend(handles, lbls, loc='lower center', ncol=4, frameon=False)
-        fig.subplots_adjust(bottom=0.12)
-
-    plt.tight_layout()
-    plt.savefig(outfile, dpi=300)
+        fig.legend(handles,
+                   lbls,
+                   loc='lower center',
+                   bbox_to_anchor=(leg_shift, 0.0),
+                   ncol=4, frameon=False)
+        fig.subplots_adjust(bottom=0.15)
+    plt.savefig(outfile, bbox_inches='tight', dpi=600)
     plt.close(fig)
 
 def plot_variable(
@@ -1940,11 +1982,30 @@ def plot_variable(
 
     ax.axvline(0, color="black", alpha=0.8)
     ax.grid(alpha=0.8, zorder=-2)
-    ax.set_title(var)
     ax.set_xlabel("Effect estimate")
     fig.tight_layout()
-    fig.savefig(outpath, dpi=300)
+    fig.savefig(outpath, bbox_inches='tight', dpi=600)
     plt.close(fig)
+
+def plot_prior_distributions(ds):
+    values_vars = [var for var in ds.data_vars if var.endswith("_values")]
+    for var in values_vars:
+        var_data = (ds[var] - ds[var].mean()).values.flatten()
+        sd = np.nanstd(var_data)
+        dist = np.random.normal(loc=0, scale=2*sd, size=1000)
+        data_min = np.nanmin(np.concatenate([var_data, dist]))
+        data_max = np.nanmax(np.concatenate([var_data, dist]))
+        bins = np.linspace(data_min, data_max, 50)
+
+        plt.figure()
+        plt.hist(var_data, bins=bins, alpha=0.5, color='blue', density=True, label='Data')
+        plt.hist(dist, bins=bins, alpha=0.5, color='orange', density=True, label='Prior')
+        plt.title(f"Histogram of {var} and Prior Distribution")
+        plt.xlabel("Value")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"outputs/prior_test/{var}.png")
+        plt.close()
 
 
 
@@ -1961,8 +2022,32 @@ def standardise_mad(values):
     mad = np.nanmedian(np.abs(values - median), axis=0, keepdims=True)
     return (values - median) / (mad * 1.4826 + 1e-8)
 
-
-
+def var_name_to_plot_name(var_name):
+    """Convert variable name to a more human-readable format for plotting."""
+    name_list = var_name.title().split("_")
+    if "Values" in name_list:
+        name_list.remove("Values")
+    if "Met" in name_list:
+        name_list.remove("Met")
+        name_list.append("(Met Office)")
+    if "Hydro" in name_list:
+        name_list.remove("Hydro")
+        name_list.append("(Hydrology)")
+    if "Aqrean" in name_list:
+        if "Daqi" in name_list:
+            name_list.remove("Daqi")
+            name_list.insert(0, "DAQI")
+        name_list.remove("Aqrean")
+        name_list.append("(AQRean)")
+    if "Nox" in name_list:
+        name_list[name_list.index("Nox")] = "NOx"
+    if "Pm10" in name_list:
+        name_list[name_list.index("Pm10")] = "PM10"
+    if "Pm2P5" in name_list:
+        name_list[name_list.index("Pm2P5")] = "PM2.5"
+    if "Sulfur" in name_list:
+        name_list[name_list.index("Sulfur")] = "Sulphur"
+    return " ".join(name_list)
 
 
 

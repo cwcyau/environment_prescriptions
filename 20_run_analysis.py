@@ -8,7 +8,7 @@ n_practices = None  # limit to n practices with most data points (for testing, s
 practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope (keep as 2 as runs within walltime)
 deseasonalise_output = True  # whether to include a seasonal correction term for output variable (items) (always True as adding seasonal term is inexpensive)
 deseasonalise_predictors = False  # whether to apply seasonal correction to predictor variables
-adjust_predictors = 'c-global'  # 'z-global': standardise values globally, 'z-practice': standardise per practice, 'c-global': centre globally, 'c-practice': centre per practice, None: raw values
+adjust_predictors = 'z-global'  # 'z-global': standardise values globally, 'z-practice': standardise per practice, 'c-global': centre globally, 'c-practice': centre per practice, None: raw values
 standardise_items = True  # whether to standardise items variable (per practice)
 results_root = "outputs/mixed_effects/"
 
@@ -32,6 +32,7 @@ flag_types = [
     "aqrean_ozone",
     "aqrean_daqi_ozone",
     "aqrean_pm2p5",
+    "aqrean_daqi_pm2p5",
     "aqrean_pm10",
     "aqrean_daqi_pm10",
     "aqrean_sulfur_dioxide",

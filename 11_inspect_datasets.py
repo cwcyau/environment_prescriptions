@@ -1,5 +1,5 @@
 import xarray as xr
-from funcs import plot_practices
+from funcs import plot_practices, plot_prior_distributions
 
 # parameters
 prescriptions_paths = [
@@ -29,6 +29,10 @@ flag_types = [
 ]
 seed = 42
 
+priors_done = False
 for prescriptions_path in prescriptions_paths:
     ds = xr.open_dataset(prescriptions_path)
-    plot_practices(ds, prescriptions_path, flag_types=flag_types, seed=seed)
+    if not priors_done:
+        plot_prior_distributions(ds)
+        priors_done = True
+    # plot_practices(ds, prescriptions_path, flag_types=flag_types, seed=seed)
