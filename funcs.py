@@ -5,7 +5,9 @@ import bambi as bmb
 import arviz as az
 import xarray as xr
 import statsmodels.formula.api as smf
+import statsmodels.api as sm
 import matplotlib.pyplot as plt
+import matplotlib.transforms as mtrans
 from datetime import datetime
 from pyproj import Transformer
 from tqdm import tqdm
@@ -1109,7 +1111,7 @@ def run_bayesian_model(
     results_folder: str,
     method: str = "standard",
     pca_components: int = 4,
-    spline_df: int = 4,
+    spline_deg_f: int = 4,
     deseasonalise_output: bool = True,
     practice_correction: int = 1,
     min_practice_obs: int = 20,
@@ -1178,14 +1180,13 @@ def run_bayesian_model(
     df = ds[["items", "date_code"] + raw_vars].to_dataframe().reset_index()
     df["date"] = pd.to_datetime(df["date"])
     df["month"] = df["date"].dt.month
-    df = df.dropna(subset=["items"]).copy()
+    df = df.dropna(subset=["items"] + raw_vars).copy()
     predictors = raw_vars.copy()
     predictor_terms = raw_vars.copy()
 
     # Replace predictor terms with PCA if requested
     if method == "pca":
         status("Applying PCA to raw variables...")
-        predictors = [v for v in raw_vars if v != "flood"]
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(df[predictors])
         pca = PCA(n_components=pca_components)
@@ -1196,15 +1197,16 @@ def run_bayesian_model(
         predictors = pc_names
         predictor_terms = pc_names
 
-    # Replace predictor_terms with spline terms if requested
+    # replace predictor_terms with spline terms if requested
     elif method == "splines":
-        status(f"Using splines for predictors (df={spline_df}) and dropping linear interactions/polynomials...")
-        # Build spline terms replacing the raw variable names.
-        # Use the `s()` notation in the formula; Bambi will decide actual basis/penalties.
+        status(f"Using splines for predictors (df={spline_deg_f}) and dropping linear interactions/polynomials...")
+        # build spline terms
         spline_terms = []
         for v in raw_vars:
             if v in df.columns and v != "flood":
-                spline_terms.append(f"bs({v}, df={spline_df})")
+                spline_terms.append(f"bs({v}, df={spline_deg_f})")
+            elif v in df.columns and v == "flood":
+                spline_terms.append("flood")
             else:
                 status(f"Warning: variable {v} not found in dataframe, skipping spline for it.")
         predictor_terms = spline_terms
@@ -1243,8 +1245,7 @@ def run_bayesian_model(
     
     # make flood flags a categorical variable
     if "flood" in predictor_terms:
-        predictor_terms = [("C(flood)" if term == "flood" else term)
-                           for term in predictor_terms]
+        predictor_terms[predictor_terms.index("flood")] = "C(flood)"
 
     # set sensible priors manually
     priors = {}
@@ -1254,7 +1255,54 @@ def run_bayesian_model(
             continue
         else:  # set priors for continuous variables by their standard deviation
             sd = df[term].std()
+            if sd == 0:
+                sd = 1.0
             priors[term] = bmb.Prior("Normal", mu=0, sigma=2*sd)
+
+    # select required columns
+    df = df[['items'] + predictors + ['practice_id', 'month', 'date_code']]
+
+    # filter practices
+    practice_counts = df.groupby('practice_id').size()
+    valid_practices = practice_counts[practice_counts >= min_practice_obs].index
+    df = df[df['practice_id'].isin(valid_practices)]
+    if df.empty:
+        raise ValueError("No practices with sufficient observations after filtering.")
+    else:
+        status(f"Using {len(valid_practices)} practices with >= {min_practice_obs} observations.")
+
+    # check for zero-variance spline terms and reduce degrees of freedom if needed
+    if method == "splines":
+        # find splines with zero variance
+        spline_terms = [p for p in predictor_terms if p.startswith("bs(")]
+        expr = " + ".join(spline_terms)
+        Xs = dmatrix(expr + " - 1", df, return_type="dataframe")  # -1 to avoid intercept
+        zero_var_spline = Xs.columns[Xs.std()==0].tolist()
+        if zero_var_spline:
+            # get unique variable names with zero-variance splines
+            bad_vars = np.unique([s.split('(')[1].split(',')[0] for s in zero_var_spline])
+            for var in bad_vars:
+                deg_f = spline_deg_f
+                # reduce degrees of freedom until non-zero variance or df < 3
+                while True:
+                    deg_f -= 1
+                    if deg_f < 3:
+                        break
+                    new_term = f"bs({var}, df={deg_f})"
+                    Xs_new = dmatrix(new_term + " - 1", df, return_type="dataframe")
+                    if not any(Xs_new.std() == 0):
+                        break
+                if deg_f < 3:
+                    predictor_terms.remove(f"bs({var}, df={spline_deg_f})")
+                    predictor_terms.append(var)
+                    sd = df[var].std()
+                    if sd == 0:
+                        sd = 1.0
+                    priors[var] = bmb.Prior("Normal", mu=0, sigma=2*sd)
+                    status(f"Reverting {var} to linear variable due to insufficient variance.")
+                else:
+                    predictor_terms = [new_term if t == f"bs({var}, df={spline_deg_f})" else t for t in predictor_terms]
+                    status(f"Reduced spline degrees of freedom for variable '{var}' to df={deg_f}.")
 
     # build formula
     formula = "items ~ " + " + ".join(predictor_terms)
@@ -1269,24 +1317,8 @@ def run_bayesian_model(
     elif practice_correction != 0:
         raise ValueError("practice_correction must be 0, 1, 2, or 3")
 
-    # clear out any nan predictors (note: when using splines Bambi will still require predictor columns present)
-    df = df.dropna(subset=predictors).copy()
-    df = df[['items'] + predictors + ['practice_id', 'month', 'date_code']]
-
-    # filter practices
-    practice_counts = df.groupby('practice_id').size()
-    valid_practices = practice_counts[practice_counts >= min_practice_obs].index
-    df = df[df['practice_id'].isin(valid_practices)]
-    if df.empty:
-        raise ValueError("No practices with sufficient observations after filtering.")
-    else:
-        status(f"Using {len(valid_practices)} practices with >= {min_practice_obs} observations.")
-
     # fit Bayesian model
     status(f"Fitting Bambi model with formula '{formula}'...")
-    # Use Bambi defaults for fixed-effect priors and residual priors.
-    # We intentionally do not override Bambi's sensible defaults for fixed effects and splines.
-    # If needed later, user can supply an explicit `priors` dict when calling this function.
     model = bmb.Model(formula, df, priors=priors)
     idata = model.fit(draws=draws,
                       tune=tune,
@@ -1316,6 +1348,196 @@ def run_bayesian_model(
     status(f"Model results saved to: {idata_path}")
 
     return model, idata
+
+def run_deprivation_mixed_models(
+    ds,
+    predictors: List[str],
+    results_folder: str,
+    deseasonalise_output: bool = False,
+    practice_correction: int = 1,
+    min_practice_obs: int = 20,
+    n_jobs: int = 1,
+):
+    """
+    Mixed-effects moderation models:
+        items ~ predictor * imd_centile (+ C(month))
+    with practice-level random effects and optional seasonal FE.
+
+    For each predictor, also runs stage-2 regressions:
+        random_intercept ~ imd_centile
+        random_slope ~ imd_centile   (if slope RE included)
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Dataset containing: items, imd_centile, predictor variables.
+    predictors : list of str
+        Predictor variable names (e.g. hydro_rain_values, met_tmax_values)
+    results_folder : str
+        Folder to save results (CSV + TXT)
+    deseasonalise_output : bool
+        Include month fixed effects (C(month))
+    practice_correction : int
+        0 = no random effects
+        1 = random intercept
+        2 = random intercept + slope
+    min_practice_obs : int
+        Minimum observations per practice
+    n_jobs : int
+        Number of parallel jobs
+    """
+
+    os.makedirs(results_folder, exist_ok=True)
+
+    # prepare base df aligned with (date, practice_id)
+    status("Preparing dataframe for moderation models...")
+    df_items = ds["items"].to_dataframe().reset_index()
+    df_items["date"] = pd.to_datetime(df_items["date"])
+    df_items["month"] = df_items["date"].dt.month
+    df_items = df_items.set_index(["date", "practice_id"])
+    df_index = df_items.index
+    df_items["imd_centile"] = (
+        ds["imd_centile"].to_dataframe()["imd_centile"].reindex(df_index)
+    )
+    df_items["date_code"] = df_items.index.get_level_values("date").map(
+        ds["date_code"].to_series()
+    )
+
+    # random effects formula
+    if practice_correction == 0:
+        re_formula = None
+    elif practice_correction == 1:
+        re_formula = "~1"
+    elif practice_correction == 2:
+        re_formula = "~1 + date_code"
+
+    def fit_model(var):
+
+        # build dataframe for this predictor
+        df = df_items.copy()
+        df[var] = ds[var].to_dataframe()[var].reindex(df_index)
+        df = df.dropna(subset=["items", var, "imd_centile"]).copy()
+
+        # practice filtering
+        df = df.reset_index(drop=True)
+        counts = df.groupby("practice_id").size()
+        valid_pracs = counts[counts >= min_practice_obs].index
+        df = df[df["practice_id"].isin(valid_pracs)]
+
+        if df.empty:
+            return dict(
+                name=var,
+                coef_pred=np.nan,
+                coef_imd=np.nan,
+                coef_int=np.nan,
+                ci_pred=(np.nan, np.nan),
+                ci_imd=(np.nan, np.nan),
+                ci_int=(np.nan, np.nan),
+                p_pred=np.nan,
+                p_imd=np.nan,
+                p_int=np.nan,
+                intercept_reg_slope=np.nan,
+                slope_reg_slope=np.nan,
+                error=f"No practices with >= {min_practice_obs} observations",
+            )
+
+        # build formula
+        formula = f"items ~ {var} * imd_centile" + (" + C(month)" if deseasonalise_output else "")
+
+        # fit mixed model
+        try:
+            md = smf.mixedlm(formula, df, groups=df["practice_id"], re_formula=re_formula)
+            mdf = md.fit(method="lbfgs", reml=True, disp=False)
+        except Exception as e:
+            return dict(name=var, error=str(e))
+
+        # get coefficients
+        def safe_ci(term):
+            try:
+                low, high = mdf.conf_int().loc[term]
+                return float(low), float(high)
+            except Exception:
+                return np.nan, np.nan
+
+        out = dict(name=var, error=None)
+
+        # predictor
+        term_pred = var
+        out["coef_pred"] = float(mdf.params.get(term_pred, np.nan))
+        out["p_pred"] = float(mdf.pvalues.get(term_pred, np.nan))
+        out["ci_pred"] = safe_ci(term_pred)
+
+        # imd_centile
+        term_imd = "imd_centile"
+        out["coef_imd"] = float(mdf.params.get(term_imd, np.nan))
+        out["p_imd"] = float(mdf.pvalues.get(term_imd, np.nan))
+        out["ci_imd"] = safe_ci(term_imd)
+
+        # interaction
+        term_int = f"{var}:imd_centile"
+        if term_int not in mdf.params:
+            term_int = f"imd_centile:{var}"  # fallback
+        out["coef_int"] = float(mdf.params.get(term_int, np.nan))
+        out["p_int"] = float(mdf.pvalues.get(term_int, np.nan))
+        out["ci_int"] = safe_ci(term_int)
+
+        # regression on random effects
+        try:
+            re = mdf.random_effects
+            re_int = pd.Series({k: v.get("Intercept", v.get("Group", np.nan)) for k, v in re.items()})
+            re_int.name = "re_intercept"
+
+            # merge deprivation per practice
+            prac_imd = (
+                df.groupby("practice_id")["imd_centile"]
+                .mean()
+                .reindex(re_int.index)
+            )
+            X = sm.add_constant(prac_imd)
+            reg_int = sm.OLS(re_int, X, missing="drop").fit()
+            out["intercept_reg_slope"] = float(reg_int.params.get("imd_centile", np.nan))
+
+            # slope RE?
+            if practice_correction == 2:
+                re_slp = pd.Series({k: v.get("date_code", np.nan) for k, v in re.items()})
+                re_slp.name = "re_slope"
+                reg_slp = sm.OLS(re_slp, X, missing="drop").fit()
+                out["slope_reg_slope"] = float(reg_slp.params.get("imd_centile", np.nan))
+            else:
+                out["slope_reg_slope"] = np.nan
+
+        except Exception as e:
+            out["intercept_reg_slope"] = np.nan
+            out["slope_reg_slope"] = np.nan
+
+        return out
+
+    # fit mixed effects models in parallel
+    status(f"Running deprivation moderation for {len(predictors)} variables...")
+    results = Parallel(n_jobs=n_jobs)(delayed(fit_model)(var) for var in tqdm(predictors))
+
+    # save results
+    results_df = pd.DataFrame(results)
+    csv_path = os.path.join(results_folder, "deprivation_moderation_results.csv")
+    results_df.to_csv(csv_path, index=False)
+    status(f"Saved results to {csv_path}")
+
+    # save prettified text output
+    txt_path = os.path.join(results_folder, "deprivation_moderation_results.txt")
+    with open(txt_path, "w") as f:
+        for _, r in results_df.iterrows():
+            f.write(
+                f"{r['name']}\n"
+                f"  pred: {r['coef_pred']:.3f} (CI: {r['ci_pred'][0]:.3f}, {r['ci_pred'][1]:.3f}),  p={r['p_pred']:.3g}\n"
+                f"  imd:  {r['coef_imd']:.3f} (CI: {r['ci_imd'][0]:.3f}, {r['ci_imd'][1]:.3f}),  p={r['p_imd']:.3g}\n"
+                f"  int:  {r['coef_int']:.3f} (CI: {r['ci_int'][0]:.3f}, {r['ci_int'][1]:.3f}),  p={r['p_int']:.3g}\n"
+                f"  RE intercept ~ IMD slope: {r['intercept_reg_slope']:.3f}\n"
+                f"  RE slope     ~ IMD slope: {r['slope_reg_slope']:.3f}\n"
+                f"  error: {r['error']}\n\n"
+            )
+    status(f"Pretty results saved to {txt_path}")
+
+    return results_df
 
 # MODELING HELPERS --------------------------------------------------------------------------------
 def prepare_ds(ds, n_practices=None, standardise_items=False, adjust_predictors=None, deseasonalise_predictors=False):
@@ -1406,6 +1628,10 @@ def make_progress_callback(total_draws, total_tune):
 
 
 # ANALYSIS FUNCTIONS ==============================================================================
+PRES_CODES = ['02_03_0501', '02', '03', '0501']
+PRES_LABELS = ['All', 'Cardiovascular', 'Respiratory', 'Antibiotics']
+PRES_COLOURS = ['black', 'red', 'blue', 'orange']
+
 def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, None), xlim_values=(None, None)):
     """
     Compare mixed-effects model analyses across prescription types.
@@ -1427,19 +1653,14 @@ def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, 
     - Per-variable flagged plots
     - Per-variable values plots
     """
-    # define prescription types
-    prescription_codes = ['02_03_0501', '02', '03', '0501']
-    labels = ['All', 'Cardiovascular', 'Respiratory', 'Antibiotics']
-    colours = ['black', 'red', 'blue', 'orange']
-
     # configure folders
     plot_root = f"{results_folder}"
     os.makedirs(plot_root, exist_ok=True)
-    results_folders = [f"{results_folder}{c}/" for c in prescription_codes]
+    results_folders = [f"{results_folder}{c}/" for c in PRES_CODES]
 
     # load data
-    data_flag, data_values = [], []
-    for folder in results_folders:
+    data_flag, data_values, data_inds = [], [], []
+    for i, folder in enumerate(results_folders):
         try:
             df_flag = pd.read_csv(f"{folder}/mixed_effects_flag_results.csv")
             df_val = pd.read_csv(f"{folder}/mixed_effects_values_results.csv")
@@ -1455,6 +1676,7 @@ def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, 
         df_val["dataset"] = folder
         data_flag.append(df_flag)
         data_values.append(df_val)
+        data_inds.append(i)
 
     # combined dataframes for per-variable plots
     df_flag_all = pd.concat(data_flag, ignore_index=True) if data_flag else \
@@ -1469,25 +1691,23 @@ def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, 
         # plot for flag variables
         plot_combined(
             df_list=data_flag,
-            labels_list=labels[:len(data_flag)],
-            colours_list=colours[:len(data_flag)],
-            hide_sulfur=hide_sulfur,
+            labels_list=[PRES_LABELS[i] for i in data_inds],
+            colours_list=[PRES_COLOURS[i] for i in data_inds],
             outfile=f"{plot_root}/mixed_flags{suffix}.png",
+            hide_sulfur=hide_sulfur,
             xlim=xlim_flag,
             y_jitter=y_jitter,
-            is_values=False
         )
 
         # plot for values variables
         plot_combined(
             df_list=data_values,
-            labels_list=labels[:len(data_values)],
-            colours_list=colours[:len(data_values)],
-            hide_sulfur=hide_sulfur,
+            labels_list=[PRES_LABELS[i] for i in data_inds],
+            colours_list=[PRES_COLOURS[i] for i in data_inds],
             outfile=f"{plot_root}/mixed_values{suffix}.png",
+            hide_sulfur=hide_sulfur,
             xlim=xlim_values,
             y_jitter=y_jitter,
-            is_values=True
         )
 
     # per-variable flag plots ---------------------------------------------------------------------
@@ -1501,8 +1721,8 @@ def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, 
         plot_variable(
             var=var,
             dataframes=data_flag,
-            labels=labels,
-            colours=colours,
+            labels=[PRES_LABELS[i] for i in data_inds],
+            colours=[PRES_COLOURS[i] for i in data_inds],
             var_extractor=flag_extractor,
             outpath=f"{plot_root}/flags/{var}.png"
         )
@@ -1518,13 +1738,13 @@ def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, 
         plot_variable(
             var=var,
             dataframes=data_values,
-            labels=labels,
-            colours=colours,
+            labels=[PRES_LABELS[i] for i in data_inds],
+            colours=[PRES_COLOURS[i] for i in data_inds],
             var_extractor=values_extractor,
             outpath=f"{plot_root}/values/{var}.png"
         )
 
-def compare_bayesian_analyses(results_folder, y_jitter=0.15):
+def compare_bayesian_analyses(results_folder, y_jitter=0.15, recalc_cis=False):
     '''Generates plots to compare the Bayesian analysis results across different prescription types.
 
     Parameters
@@ -1534,90 +1754,84 @@ def compare_bayesian_analyses(results_folder, y_jitter=0.15):
     y_jitter : float, optional
         Vertical jitter amount between overlapping categories in the combined plot.
     '''
-    # prescription type definitions (hardcoded for now)
-    prescription_codes = ['02_03_0501', '02', '03', '0501']
-    labels = ['All', 'Cardiovascular', 'Respiratory', 'Antibiotics']
-    colours = ['black', 'red', 'blue', 'orange']
-
     # set input and output paths correctly
-    results_roots = [
-        f"{results_folder}{c}/" for c in prescription_codes
+    results_folders = [
+        f"{results_folder}{c}/" for c in PRES_CODES
     ]
     plot_root = results_folder
 
     # load data
-    value_vars = None
-    dataframes = []
-    for root in results_roots:
-        nc_path = root + f"bayesian_model_idata.nc"
+    plot_vars = None
+    dataframes, data_inds = [], []
+    for i, folder in enumerate(results_folders):
+        status(f"Loading Bayesian results from {folder}...")
+        nc_path = folder + "bayesian_model_idata.nc"
+        new_summary_path = folder + "bayesian_model_summary_95pcCIs.csv"
         if not os.path.exists(nc_path):
-            print(f"Warning: could not find results at {nc_path}, skipping...")
+            status(f"Warning: could not find results at {nc_path}, skipping...")
             continue
 
-        # load inference data and extract 95% HDIs
-        idata = az.from_netcdf(nc_path)
-        summary = az.summary(idata, hdi_prob=0.95)
+        if recalc_cis or not os.path.exists(new_summary_path):
+            # or load inference data and calculate 95% HDIs
+            status(f"Processing {nc_path}...")
+            idata = az.from_netcdf(nc_path)
+            summary = az.summary(idata, hdi_prob=0.95)
+            df = summary.reset_index().rename(columns={"index": "name"})
+            df.to_csv(new_summary_path, index=False)
+            status(f"  saved summary to {new_summary_path}")
+        else:
+            # load saved summary with 95% CIs
+            status(f"Loading cached summary from {new_summary_path}")
+            df = pd.read_csv(new_summary_path)
 
         # clean and prepare dataframe
-        df = summary.reset_index().rename(columns={"index": "name"})
         if df.empty:
-            print(f"Warning: results in {nc_path} are empty, skipping...")
+            status(f"Warning: results in {nc_path} are empty, skipping...")
             continue
 
-        dataframes.append(df)
-
         # find variables to plot for
-        if value_vars is None:
-            value_vars = [v for v in df["name"]
+        if plot_vars is None:
+            plot_vars = [v for v in df["name"]
                           if not any(x in v for x in ["|", "month", "Intercept", "sigma"])]
+
+        # save dataframe and index
+        dataframes.append(df[df["name"].isin(plot_vars)].copy())
+        data_inds.append(i)
 
     if not dataframes:
         raise FileNotFoundError("No Bayesian results (.nc) found — nothing to plot.")
 
     # combined plot -------------------------------------------------------------------------------
-    plt.figure(figsize=(10, 8))
-    for i, (df, label, color) in enumerate(zip(dataframes, labels, colours)):
-        if df.empty:  # skip missing ones
-            continue
+    status("Generating combined Bayesian plot...")
+    plot_root = results_folder
+    os.makedirs(plot_root, exist_ok=True)
 
-        # get data for this var
-        df = df[df["name"].isin(value_vars)].copy()
-        df = df.set_index("name").reindex(value_vars)
-
-        # set jitter position and plot
-        y_pos = np.arange(len(value_vars)) + (i - len(dataframes) / 2) * y_jitter
-        plt.errorbar(
-            df["mean"], y_pos,
-            xerr=[df["mean"] - df["hdi_2.5%"], df["hdi_97.5%"] - df["mean"]],
-            fmt='o', color=color, label=label, markersize=4, capsize=3
-        )
-
-    # plot formatting
-    var_names = [" ".join(v.replace("_values", "").split("_")) for v in value_vars]
-    plt.axvline(0, color='black', alpha=0.8)
-    plt.yticks(np.arange(len(value_vars)), var_names)
-    plt.grid(alpha=0.8)
-    plt.legend()
-    plt.xlabel("Posterior mean (effect size)")
-    plt.title("Bayesian model coefficients")
-    plt.tight_layout()
-    plt.savefig(plot_root + f"bayesian.png", dpi=300)
-    plt.close(fig='all')
-    print(f"Combined plot saved to {plot_root}bayesian.png")
+    # generate combined plot
+    plot_combined(
+        df_list=dataframes,
+        labels_list=[PRES_LABELS[i] for i in data_inds],
+        colours_list=[PRES_COLOURS[i] for i in data_inds],
+        outfile=os.path.join(plot_root, "bayesian.png"),
+        col_est="mean",
+        col_low="hdi_2.5%",
+        col_high="hdi_97.5%",
+    )
+    status(f"Combined plot saved to {plot_root}bayesian.png")
 
     # per-variable plots --------------------------------------------------------------------------
+    status("Generating per-variable Bayesian plots...")
     plot_folder = f"{plot_root}values_bayes/"
     os.makedirs(plot_folder, exist_ok=True)
 
     def bayes_extractor(df, var):
         return df[df["name"] == var]
 
-    for var in value_vars:
+    for var in plot_vars:
         plot_variable(
             var=var,
             dataframes=dataframes,
-            labels=labels,
-            colours=colours,
+            labels=[PRES_LABELS[i] for i in data_inds],
+            colours=[PRES_COLOURS[i] for i in data_inds],
             var_extractor=bayes_extractor,
             outpath=f"{plot_folder}{var}.png",
             col_est="mean",
@@ -1627,10 +1841,11 @@ def compare_bayesian_analyses(results_folder, y_jitter=0.15):
 
     print(f"Per-variable plots saved to {plot_folder}")
 
-def generate_bayesian_diagnostics(results_root, prescription_codes=['02_03_0501', '02', '03', '0501']):
-    results_folders = [f"{results_root}{c}/" for c in prescription_codes]
+def generate_bayesian_diagnostics(results_root):
+    results_folders = [f"{results_root}{c}/" for c in PRES_CODES]
     az.rcParams["plot.max_subplots"] = 40
     for folder in results_folders:
+        status(f"Generating Bayesian diagnostics for results in {folder}...")
         # get the inference data
         nc_path = os.path.join(folder, f"bayesian_model_idata.nc")
         if not os.path.exists(nc_path):
@@ -1694,13 +1909,10 @@ def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15
     y_jitter : float
         Vertical jitter for categorical variables when plotting multiple prescription types.
     """
-    prescription_codes = ['02_03_0501', '02', '03', '0501']
-    colours = ['black', 'red', 'blue', 'orange']
-
     # preload idata and original datasets
     idata_dict = {}
     data_dict = {}
-    for pres_code in prescription_codes:
+    for pres_code in PRES_CODES:
         # load idata
         nc_path = os.path.join(results_folder, pres_code, "bayesian_model_idata.nc")
         if os.path.exists(nc_path):
@@ -1740,7 +1952,7 @@ def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15
     for var in spline_vars + categorical_vars:
         fig, ax = plt.subplots(figsize=(6, 4))
 
-        for i, (pres_code, color) in enumerate(zip(prescription_codes, colours)):
+        for i, (pres_code, color) in enumerate(zip(PRES_CODES, PRES_COLOURS)):
             idata = idata_dict[pres_code]
             ds = data_dict[pres_code]
             if idata is None or ds is None:
@@ -1791,7 +2003,7 @@ def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15
                 n_categories = len(categories)
 
                 # plot
-                y_pos = np.arange(n_categories) + y_jitter*(i - (len(prescription_codes)-1)/2)
+                y_pos = np.arange(n_categories) + y_jitter*(i - (len(PRES_CODES)-1)/2)
                 ax.errorbar(y_pos, means, yerr=[means - lows, highs - means],
                             fmt='o', color=color, label=pres_code)
                 ax.axhline(0, color='black', alpha=0.8, zorder=-1)
@@ -1812,16 +2024,97 @@ def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15
 
     print(f"All spline and categorical plots saved to {out_dir}")
 
+def compare_deprivation_analyses(folder_path, save_path=None):
+    """
+    Compare deprivation moderation model results across several prescription types.
+
+    This function searches inside:
+        folder_path/<prescription_type>/deprivation_moderation_results.csv
+
+    and plots collated results in 5 panels:
+        - Predictor main effect
+        - IMD main effect
+        - Interaction effect
+        - Stage-2: RE intercept ~ IMD slope
+        - Stage-2: RE slope ~ IMD slope
+
+    Parameters
+    ----------
+    folder_path : str
+        Path containing one subfolder per prescription type.
+    save_path : str or None
+        If provided, save the figure to this path.
+    """
+    # load results for each prescription type
+    results_dict = {}
+    for p in PRES_CODES:
+        csv_path = os.path.join(folder_path, p, "deprivation_moderation_results.csv")
+        if not os.path.exists(csv_path):
+            print(f"WARNING: Missing file {csv_path}")
+            continue
+        df = pd.read_csv(csv_path)
+        df["prescription_type"] = p
+        results_dict[p] = df
+
+    if len(results_dict) == 0:
+        raise ValueError("No deprivation_moderation_results.csv files found.")
+
+    # combine to dataframe
+    combined = pd.concat(results_dict.values(), ignore_index=True)
+    predictors = combined["name"].unique()
+    n = len(predictors)
+
+    # plot configuration
+    fig, axes = plt.subplots(1, 5, figsize=(24, 5), sharey=False)
+    titles = [
+        "Predictor effect",
+        "IMD effect",
+        "Interaction effect",
+        "RE intercept ~ IMD slope",
+        "RE slope ~ IMD slope"
+    ]
+    coeff_cols = [
+        "coef_pred", "coef_imd", "coef_int",
+        "intercept_reg_slope", "slope_reg_slope"
+    ]
+    x_positions = np.arange(n)
+
+    # plot generation
+    for ax, title, col in zip(axes, titles, coeff_cols):
+        ax.axhline(0, color="k", lw=1, alpha=0.3)
+        ax.set_title(title)
+        ax.grid(alpha=0.2)
+        for p, c, l in zip(PRES_CODES, PRES_COLOURS, PRES_LABELS):
+            if p not in results_dict:
+                continue
+
+            dfp = results_dict[p].set_index("name").loc[predictors]  # align order
+            ax.scatter(x_positions, dfp[col].values, label=l, s=35, c=c)
+
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(predictors, rotation=90)
+
+    axes[0].legend(title="Prescription type", bbox_to_anchor=(1.05, 1), loc="upper left")
+
+    # save figure
+    fig.tight_layout()
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+
 # ANALYSIS HELPERS --------------------------------------------------------------------------------
 def plot_combined(
-    df_list,
-    labels_list,
-    colours_list,
-    hide_sulfur,
-    outfile,
-    xlim,
-    y_jitter,
-    is_values=False
+    df_list: list,
+    labels_list: list,
+    colours_list: list,
+    outfile: str,
+    xlim: tuple = (None, None),
+    y_jitter: float = 0.15,
+    legend_y_offset_px: int = 42,
+    hide_sulfur: bool = False,
+    col_est: str = "coef",
+    col_low: str = "ci_low",
+    col_high: str = "ci_high",
 ):
     """
     Plot a combined figure for either flagged or values mixed-effects models.
@@ -1863,7 +2156,7 @@ def plot_combined(
     nan_excluded = []
     for name in all_names:
         any_non_nan = any(
-            df.loc[df["name"] == name, "coef"].notna().any()
+            df.loc[df["name"] == name, col_est].notna().any()
             for df in df_list
         )
         if any_non_nan:
@@ -1880,7 +2173,7 @@ def plot_combined(
     final_varnames = sorted((var_name_to_plot_name(n) for n in valid_names), reverse=True)
     name_to_idx = {name: j for j, name in enumerate(final_varnames)}
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(10, 1 + len(final_varnames)*5/18))
 
     for i, (df, label, colour) in enumerate(zip(df_list, labels_list, colours_list)):
         df_plot = df.copy()
@@ -1901,8 +2194,8 @@ def plot_combined(
 
         # plot
         ax.errorbar(
-            df_plot["coef"], y_positions,
-            xerr=[df_plot["coef"] - df_plot["ci_low"], df_plot["ci_high"] - df_plot["coef"]],
+            df_plot[col_est], y_positions,
+            xerr=[df_plot[col_est] - df_plot[col_low], df_plot[col_high] - df_plot[col_est]],
             fmt='o', color=colour, label=label, markersize=4, capsize=3
         )
 
@@ -1911,24 +2204,31 @@ def plot_combined(
         ax.set_yticks(np.arange(len(final_varnames)))
         ax.set_yticklabels(final_varnames)
 
+    # plot formatting
     ax.axvline(0, color='black', alpha=0.8, zorder=-1)
     ax.grid(alpha=0.8, zorder=-2)
     ax.set_xlim(xlim)
     ax.set_xlabel("Coefficient estimate")
     plt.tight_layout()
 
-    handles, lbls = ax.get_legend_handles_labels()
-    if is_values:
-        leg_shift = 0.66
-    else:
-        leg_shift = 0.71
-    if handles:
-        fig.legend(handles,
-                   lbls,
-                   loc='lower center',
-                   bbox_to_anchor=(leg_shift, 0.0),
-                   ncol=4, frameon=False)
-        fig.subplots_adjust(bottom=0.15)
+    # add legend ----------------------------------------------------
+    # get axes height in pixels and convert to axes fraction
+    renderer = fig.canvas.get_renderer()
+    bbox = ax.get_window_extent(renderer=renderer)
+    axes_height_px = bbox.height
+    y_offset_frac = legend_y_offset_px / axes_height_px
+
+    # place legend using axes coordinates
+    ax.legend(
+        loc='upper center',
+        bbox_to_anchor=(0.5, -y_offset_frac),
+        bbox_transform=ax.transAxes,
+        ncol=4,
+        frameon=False
+    )
+    # ---------------------------------------------------------------
+
+    # save figure
     plt.savefig(outfile, bbox_inches='tight', dpi=600)
     plt.close(fig)
 
@@ -2023,31 +2323,68 @@ def standardise_mad(values):
     return (values - median) / (mad * 1.4826 + 1e-8)
 
 def var_name_to_plot_name(var_name):
-    """Convert variable name to a more human-readable format for plotting."""
-    name_list = var_name.title().split("_")
-    if "Values" in name_list:
-        name_list.remove("Values")
-    if "Met" in name_list:
-        name_list.remove("Met")
-        name_list.append("(Met Office)")
-    if "Hydro" in name_list:
-        name_list.remove("Hydro")
-        name_list.append("(Hydrology)")
-    if "Aqrean" in name_list:
-        if "Daqi" in name_list:
-            name_list.remove("Daqi")
-            name_list.insert(0, "DAQI")
-        name_list.remove("Aqrean")
-        name_list.append("(AQRean)")
-    if "Nox" in name_list:
-        name_list[name_list.index("Nox")] = "NOx"
-    if "Pm10" in name_list:
-        name_list[name_list.index("Pm10")] = "PM10"
-    if "Pm2P5" in name_list:
-        name_list[name_list.index("Pm2P5")] = "PM2.5"
-    if "Sulfur" in name_list:
-        name_list[name_list.index("Sulfur")] = "Sulphur"
-    return " ".join(name_list)
+    """
+    Prettify variable names for plotting.
+
+    - Categorical vars: C(var)[cat] -> "var"
+      (will not work for multi-level, but currently only handling C(flood)[1.0])
+    - Interactions: var1:var2 -> "Interaction: pretty_var1 - pretty_var2"
+    - Otherwise moves dataset name to end in brackets, capitalises,
+      removes "_values" suffix and replaces unusual strings like pm2p5 with PM2.5.
+      aqrean_daqi_nitrogen_dioxide_values -> "DAQI Nitrogen Dioxide (AQRean)"
+    """
+    def clean_single_var(v):
+        # capitalise and split
+        name_list = v.title().split("_")
+
+        # remove "Values" (from "_values" suffix)
+        if "Values" in name_list:
+            name_list.remove("Values")
+        
+        # replace categorical variable
+        if name_list[0].startswith("C("):
+            name_list[0] = name_list[0].split("(")[1].split(")")[0]
+
+        # move dataset names to end
+        if "Met" in name_list:
+            name_list.remove("Met")
+            name_list.append("(Met Office)")
+        if "Hydro" in name_list:
+            name_list.remove("Hydro")
+            name_list.append("(Hydrology)")
+        if "Aqrean" in name_list:
+            # put DAQI first to keep together when sorted
+            if "Daqi" in name_list:
+                name_list.remove("Daqi")
+                name_list.insert(0, "DAQI")
+            name_list.remove("Aqrean")
+            name_list.append("(AQRean)")
+        
+        # modify strings with unusual names
+        if "Nox" in name_list:
+            name_list[name_list.index("Nox")] = "NOx"
+        if "Pm10" in name_list:
+            name_list[name_list.index("Pm10")] = "PM10"
+        if "Pm2P5" in name_list:  # note the P capitalisation
+            name_list[name_list.index("Pm2P5")] = "PM2.5"
+        if "Sulfur" in name_list:
+            name_list[name_list.index("Sulfur")] = "Sulphur"
+
+        return " ".join(name_list)
+
+    if ":" in var_name:
+        # handle interaction terms
+        var1, var2 = var_name.split(":")
+        pretty_var1 = clean_single_var(var1.strip())
+        pretty_var2 = clean_single_var(var2.strip())
+        return f"Int: {pretty_var1} - {pretty_var2}"  # "Int" is shorter than "Interaction"
+    else:
+        # handle normal or categorical terms
+        return clean_single_var(var_name)
+
+
+
+
 
 
 
