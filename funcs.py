@@ -8,6 +8,7 @@ import statsmodels.formula.api as smf
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import matplotlib.transforms as mtrans
+import matplotlib.patches as mpatches
 from datetime import datetime
 from pyproj import Transformer
 from tqdm import tqdm
@@ -302,7 +303,7 @@ def add_particulate_flags(prescriptions_ds, particulates_ds, mass_z_thresh=1.5, 
 
 def add_deprivation_index(prescriptions_ds, deprivation_ds):
     """
-    Add imd_centile and imd_lad_code to prescriptions_ds by matching each
+    Add imd_centile_values and imd_lad_code to prescriptions_ds by matching each
     (date, practice_id) to the nearest LAD centroid in deprivation_ds for the
     nearest deprivation year.
 
@@ -403,7 +404,7 @@ def add_deprivation_index(prescriptions_ds, deprivation_ds):
 
     # add to prescriptions dataset
     prescriptions_ds = prescriptions_ds.copy()
-    prescriptions_ds["imd_centile"] = (("date", "practice_id"), imd_centile)
+    prescriptions_ds["imd_centile_values"] = (("date", "practice_id"), imd_centile)
     prescriptions_ds["imd_lad_code"] = (("date", "practice_id"), imd_lad_code)
     prescriptions_ds["imd_latitude"] = (("date", "practice_id"), imd_lat)
     prescriptions_ds["imd_longitude"] = (("date", "practice_id"), imd_lon)
@@ -1360,17 +1361,17 @@ def run_deprivation_mixed_models(
 ):
     """
     Mixed-effects moderation models:
-        items ~ predictor * imd_centile (+ C(month))
+        items ~ predictor * imd_centile_values (+ C(month))
     with practice-level random effects and optional seasonal FE.
 
     For each predictor, also runs stage-2 regressions:
-        random_intercept ~ imd_centile
-        random_slope ~ imd_centile   (if slope RE included)
+        random_intercept ~ imd_centile_values
+        random_slope ~ imd_centile_values   (if slope RE included)
 
     Parameters
     ----------
     ds : xarray.Dataset
-        Dataset containing: items, imd_centile, predictor variables.
+        Dataset containing: items, imd_centile_values, predictor variables.
     predictors : list of str
         Predictor variable names (e.g. hydro_rain_values, met_tmax_values)
     results_folder : str
@@ -1388,6 +1389,7 @@ def run_deprivation_mixed_models(
     """
 
     os.makedirs(results_folder, exist_ok=True)
+    imd_var_name = "imd_centile_values"
 
     # prepare base df aligned with (date, practice_id)
     status("Preparing dataframe for moderation models...")
@@ -1396,8 +1398,8 @@ def run_deprivation_mixed_models(
     df_items["month"] = df_items["date"].dt.month
     df_items = df_items.set_index(["date", "practice_id"])
     df_index = df_items.index
-    df_items["imd_centile"] = (
-        ds["imd_centile"].to_dataframe()["imd_centile"].reindex(df_index)
+    df_items[imd_var_name] = (
+        ds[imd_var_name].to_dataframe()[imd_var_name].reindex(df_index)
     )
     df_items["date_code"] = df_items.index.get_level_values("date").map(
         ds["date_code"].to_series()
@@ -1412,11 +1414,11 @@ def run_deprivation_mixed_models(
         re_formula = "~1 + date_code"
 
     def fit_model(var):
-
         # build dataframe for this predictor
         df = df_items.copy()
         df[var] = ds[var].to_dataframe()[var].reindex(df_index)
-        df = df.dropna(subset=["items", var, "imd_centile"]).copy()
+        df = df.dropna(subset=["items", var, imd_var_name]).copy()
+        df["practice_id"] = df.index.get_level_values("practice_id")
 
         # practice filtering
         df = df.reset_index(drop=True)
@@ -1442,7 +1444,7 @@ def run_deprivation_mixed_models(
             )
 
         # build formula
-        formula = f"items ~ {var} * imd_centile" + (" + C(month)" if deseasonalise_output else "")
+        formula = f"items ~ {var} * {imd_var_name}" + (" + C(month)" if deseasonalise_output else "")
 
         # fit mixed model
         try:
@@ -1468,15 +1470,15 @@ def run_deprivation_mixed_models(
         out["ci_pred"] = safe_ci(term_pred)
 
         # imd_centile
-        term_imd = "imd_centile"
+        term_imd = imd_var_name
         out["coef_imd"] = float(mdf.params.get(term_imd, np.nan))
         out["p_imd"] = float(mdf.pvalues.get(term_imd, np.nan))
         out["ci_imd"] = safe_ci(term_imd)
 
         # interaction
-        term_int = f"{var}:imd_centile"
+        term_int = f"{var}:{imd_var_name}"
         if term_int not in mdf.params:
-            term_int = f"imd_centile:{var}"  # fallback
+            term_int = f"{imd_var_name}:{var}"  # fallback
         out["coef_int"] = float(mdf.params.get(term_int, np.nan))
         out["p_int"] = float(mdf.pvalues.get(term_int, np.nan))
         out["ci_int"] = safe_ci(term_int)
@@ -1489,20 +1491,20 @@ def run_deprivation_mixed_models(
 
             # merge deprivation per practice
             prac_imd = (
-                df.groupby("practice_id")["imd_centile"]
+                df.groupby("practice_id")[imd_var_name]
                 .mean()
                 .reindex(re_int.index)
             )
             X = sm.add_constant(prac_imd)
             reg_int = sm.OLS(re_int, X, missing="drop").fit()
-            out["intercept_reg_slope"] = float(reg_int.params.get("imd_centile", np.nan))
+            out["intercept_reg_slope"] = float(reg_int.params.get(imd_var_name, np.nan))
 
             # slope RE?
             if practice_correction == 2:
                 re_slp = pd.Series({k: v.get("date_code", np.nan) for k, v in re.items()})
                 re_slp.name = "re_slope"
                 reg_slp = sm.OLS(re_slp, X, missing="drop").fit()
-                out["slope_reg_slope"] = float(reg_slp.params.get("imd_centile", np.nan))
+                out["slope_reg_slope"] = float(reg_slp.params.get(imd_var_name, np.nan))
             else:
                 out["slope_reg_slope"] = np.nan
 
@@ -1680,9 +1682,9 @@ def compare_individual_analyses(results_folder, y_jitter=0.15, xlim_flag=(None, 
 
     # combined dataframes for per-variable plots
     df_flag_all = pd.concat(data_flag, ignore_index=True) if data_flag else \
-                  pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset"])
+                  pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset", "pval"])
     df_val_all = pd.concat(data_values, ignore_index=True) if data_values else \
-                 pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset"])
+                 pd.DataFrame(columns=["name", "coef", "ci_low", "ci_high", "dataset", "pval"])
 
     # combined flag and values plots --------------------------------------------------------------
     for hide_sulfur in [True, False]:
@@ -2024,7 +2026,7 @@ def compare_bayesian_spline_analyses(results_folder, n_points=200, y_jitter=0.15
 
     print(f"All spline and categorical plots saved to {out_dir}")
 
-def compare_deprivation_analyses(folder_path, save_path=None):
+def compare_deprivation_analyses(folder_path, save_path=None, y_jitter=0.15):
     """
     Compare deprivation moderation model results across several prescription types.
 
@@ -2043,7 +2045,9 @@ def compare_deprivation_analyses(folder_path, save_path=None):
     folder_path : str
         Path containing one subfolder per prescription type.
     save_path : str or None
-        If provided, save the figure to this path.
+        If provided, save the figure to this path, otherwise save to folder_path/deprivation_comparison.png
+    y_jitter : float, optional
+        Vertical jitter for visibility, by default 0.15
     """
     # load results for each prescription type
     results_dict = {}
@@ -2065,23 +2069,23 @@ def compare_deprivation_analyses(folder_path, save_path=None):
     n = len(predictors)
 
     # plot configuration
-    fig, axes = plt.subplots(1, 5, figsize=(24, 5), sharey=False)
+    fig, axes = plt.subplots(5, 1, figsize=(5, 4 + n * 20/18), sharey=False)
     titles = [
-        "Predictor effect",
-        "IMD effect",
-        "Interaction effect",
-        "RE intercept ~ IMD slope",
-        "RE slope ~ IMD slope"
+        "Predictor effect (1SD increase in predictor @ mean IMD)",
+        "IMD effect (1SD centile increase (dep. decrease) @ mean predictor)",
+        "Interaction effect (change on effect of predictor as dep. decreases)",
+        "RE intercept ~ IMD slope (assoc. between baseline prescribing & decreasing dep.)",
+        "RE slope ~ IMD slope (assoc. between prescribing change & decreasing dep.)",
     ]
     coeff_cols = [
         "coef_pred", "coef_imd", "coef_int",
         "intercept_reg_slope", "slope_reg_slope"
     ]
-    x_positions = np.arange(n)
+    y_positions = np.arange(n)
 
     # plot generation
     for ax, title, col in zip(axes, titles, coeff_cols):
-        ax.axhline(0, color="k", lw=1, alpha=0.3)
+        ax.axvline(0, color="k", lw=1, zorder=-1)
         ax.set_title(title)
         ax.grid(alpha=0.2)
         for p, c, l in zip(PRES_CODES, PRES_COLOURS, PRES_LABELS):
@@ -2089,18 +2093,26 @@ def compare_deprivation_analyses(folder_path, save_path=None):
                 continue
 
             dfp = results_dict[p].set_index("name").loc[predictors]  # align order
-            ax.scatter(x_positions, dfp[col].values, label=l, s=35, c=c)
+            y_pos_jittered = y_positions + (y_jitter * (PRES_CODES.index(p) - (len(PRES_CODES)-1)/2))
+            ax.scatter(dfp[col].values, y_pos_jittered, label=l, s=35, c=c, alpha=0.8)
 
-        ax.set_xticks(x_positions)
-        ax.set_xticklabels(predictors, rotation=90)
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels(predictors)
+        ax.set_xlim(-0.1, 0.1)
 
-    axes[0].legend(title="Prescription type", bbox_to_anchor=(1.05, 1), loc="upper left")
+    axes[0].legend(title="Prescription type",
+                   bbox_to_anchor=(1.05, 1),
+                   loc="upper left",
+                   frameon=False)
 
     # save figure
     fig.tight_layout()
     if save_path is not None:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.savefig(save_path, dpi=600, bbox_inches="tight")
+    else:
+        plt.savefig(os.path.join(folder_path, "deprivation_comparison.png"),
+                    dpi=600, bbox_inches="tight")
 
 # ANALYSIS HELPERS --------------------------------------------------------------------------------
 def plot_combined(
@@ -2174,6 +2186,7 @@ def plot_combined(
     name_to_idx = {name: j for j, name in enumerate(final_varnames)}
 
     fig, ax = plt.subplots(figsize=(10, 1 + len(final_varnames)*5/18))
+    pval_transform = mtrans.blended_transform_factory(ax.transAxes, ax.transData)
 
     for i, (df, label, colour) in enumerate(zip(df_list, labels_list, colours_list)):
         df_plot = df.copy()
@@ -2190,14 +2203,40 @@ def plot_combined(
         df_plot = df_plot[df_plot["plot_name"].isin(final_varnames)].copy()
         df_plot["idx"] = df_plot["plot_name"].map(name_to_idx)
         df_plot = df_plot.sort_values("idx")
-        y_positions = df_plot["idx"].values + (i - len(df_list)/2) * y_jitter
 
         # plot
+        y_positions = df_plot["idx"].values + (i - (len(df_list) - 1)/2) * y_jitter
         ax.errorbar(
             df_plot[col_est], y_positions,
             xerr=[df_plot[col_est] - df_plot[col_low], df_plot[col_high] - df_plot[col_est]],
             fmt='o', color=colour, label=label, markersize=4, capsize=3
         )
+
+        # add p-value annotations if available
+        if "pval" in df_plot.columns:
+            pvals = df_plot["pval"].apply(convert_pval).values
+            y_pos_pval = df_plot["idx"].values + (i - (len(df_list) - 1)/2) * (y_jitter * 1.5) - 0.1
+            for y, pval in zip(y_pos_pval, pvals):
+                ax.text(1.02, y, pval,
+                        transform=pval_transform,
+                        horizontalalignment='left',
+                        verticalalignment='center',
+                        fontsize=10,
+                        color=colour)
+
+    # add grey boxes around the pvalue annotations
+    if any("pval" in df.columns for df in df_list):
+        for y in df_plot["idx"].values:
+            rect = mpatches.Rectangle(
+                        (1.01, y - 0.5),
+                        width=0.1,
+                        height=0.9,
+                        transform=pval_transform,
+                        color='lightgrey',
+                        alpha=1.0,
+                        zorder=-1
+                    )
+            ax.add_patch(rect)
 
     # y-axis labels
     if final_varnames:
@@ -2205,8 +2244,8 @@ def plot_combined(
         ax.set_yticklabels(final_varnames)
 
     # plot formatting
-    ax.axvline(0, color='black', alpha=0.8, zorder=-1)
     ax.grid(alpha=0.8, zorder=-2)
+    ax.axvline(0, color='black', zorder=-1)
     ax.set_xlim(xlim)
     ax.set_xlabel("Coefficient estimate")
     plt.tight_layout()
@@ -2307,6 +2346,15 @@ def plot_prior_distributions(ds):
         plt.savefig(f"outputs/prior_test/{var}.png")
         plt.close()
 
+def convert_pval(p):
+    if p < 0.001:
+        return "***"
+    elif p < 0.01:
+        return "**"
+    elif p < 0.05:
+        return "*"
+    else:
+        return ""
 
 
 # GENERAL HELPERS =================================================================================
@@ -2369,6 +2417,12 @@ def var_name_to_plot_name(var_name):
             name_list[name_list.index("Pm2P5")] = "PM2.5"
         if "Sulfur" in name_list:
             name_list[name_list.index("Sulfur")] = "Sulphur"
+        if "Rain" in name_list:
+            name_list[name_list.index("Rain")] = "Rainfall"
+        if "Tmin" in name_list:
+            name_list[name_list.index("Tmin")] = "Minimum Temperature"
+        if "Tmax" in name_list:
+            name_list[name_list.index("Tmax")] = "Maximum Temperature"
 
         return " ".join(name_list)
 

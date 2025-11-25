@@ -63,13 +63,19 @@ lats = np.zeros((len(unique_codes), 3)) * np.nan
 for i, code in enumerate(unique_codes):
     # rank centiles
     temp = index_2015_data[index_2015_data[code_col_2015] == code][rank_col_2015]
-    if len(temp) > 0:
+    if len(temp) > 1:
+        raise ValueError(f"Multiple entries found for code {code} in 2015 data.")
+    elif len(temp) > 0:
         centiles[i, 0] = np.floor(100 * temp.values[0] / len(index_2015_data))
     temp = index_2019_data[index_2019_data[code_col_2019] == code][rank_col_2019]
-    if len(temp) > 0:
+    if len(temp) > 1:
+        raise ValueError(f"Multiple entries found for code {code} in 2019 data.")
+    elif len(temp) > 0:
         centiles[i, 1] = np.floor(100 * temp.values[0] / len(index_2019_data))
     temp = index_2025_data[index_2025_data[code_col_2025] == code][rank_col_2025]
-    if len(temp) > 0:
+    if len(temp) > 1:
+        raise ValueError(f"Multiple entries found for code {code} in 2025 data.")
+    elif len(temp) > 0:
         centiles[i, 2] = np.floor(100 * temp.values[0] / len(index_2025_data))
 
     # lon/lats

@@ -1,5 +1,5 @@
 import xarray as xr
-from funcs import prepare_ds, run_all_flag_mixed_models, run_all_value_mixed_models, status
+from funcs import prepare_ds, run_all_flag_mixed_models, run_all_value_mixed_models, compare_individual_analyses, status
 
 # parameters
 min_practice_obs = 20  # practices with fewer points will be excluded
@@ -43,47 +43,48 @@ flag_types = [
 value_vars = [ft + "_values" for ft in flag_types if ft != "flood"]
 
 if __name__ == "__main__":
-    for codes in prescription_codes:
-        # set the path to get correct flags (generated from deseasonalised or non-deseasonalised values)
-        if deseasonalise_predictors:
-            input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags_deseasonalised.nc"
-        else:
-            input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags.nc"
-        results_folder = f"{results_root}{codes}/"
+    # for codes in prescription_codes:
+    #     # set the path to get correct flags (generated from deseasonalised or non-deseasonalised values)
+    #     if deseasonalise_predictors:
+    #         input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags_deseasonalised.nc"
+    #     else:
+    #         input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags.nc"
+    #     results_folder = f"{results_root}{codes}/"
 
-        # get the data and set save folder
-        status(f"Processing file: {input_path}")
-        ds = xr.load_dataset(input_path)
-        ds = prepare_ds(ds,
-                        n_practices=n_practices,
-                        standardise_items=standardise_items,
-                        adjust_predictors=adjust_predictors,
-                        deseasonalise_predictors=deseasonalise_predictors)
+    #     # get the data and set save folder
+    #     status(f"Processing file: {input_path}")
+    #     ds = xr.load_dataset(input_path)
+    #     ds = prepare_ds(ds,
+    #                     n_practices=n_practices,
+    #                     standardise_items=standardise_items,
+    #                     adjust_predictors=adjust_predictors,
+    #                     deseasonalise_predictors=deseasonalise_predictors)
 
-        # run mixed models comparing flags
-        # compares:
-        #    flooding: flood == 1 to flood == 0
-        #    met and hydro: high/low to median periods
-        #    particulate mass: high == 1 to high == 0
-        #    particulate DAQI: (very high, high) to (moderate, low) and (very high, high, moderate) to (low)
-        status(f"Running mixed-effects models for flags...")
-        run_all_flag_mixed_models(ds,
-                                flag_types,
-                                results_folder,
-                                deseasonalise_output=deseasonalise_output,
-                                practice_correction=practice_correction,
-                                min_practice_obs=min_practice_obs,
-                                n_jobs=n_jobs,)
+    #     # run mixed models comparing flags
+    #     # compares:
+    #     #    flooding: flood == 1 to flood == 0
+    #     #    met and hydro: high/low to median periods
+    #     #    particulate mass: high == 1 to high == 0
+    #     #    particulate DAQI: (very high, high) to (moderate, low) and (very high, high, moderate) to (low)
+    #     status(f"Running mixed-effects models for flags...")
+    #     run_all_flag_mixed_models(ds,
+    #                             flag_types,
+    #                             results_folder,
+    #                             deseasonalise_output=deseasonalise_output,
+    #                             practice_correction=practice_correction,
+    #                             min_practice_obs=min_practice_obs,
+    #                             n_jobs=n_jobs,)
 
-        # run mixed models using raw measurements
-        # handles all variables except for flooding, as there are no values for this
-        status(f"Running mixed-effects models for values...")
-        run_all_value_mixed_models(ds,
-                                value_vars,
-                                results_folder,
-                                deseasonalise_output=deseasonalise_output,
-                                practice_correction=practice_correction,
-                                min_practice_obs=min_practice_obs,
-                                n_jobs=n_jobs)
+    #     # run mixed models using raw measurements
+    #     # handles all variables except for flooding, as there are no values for this
+    #     status(f"Running mixed-effects models for values...")
+    #     run_all_value_mixed_models(ds,
+    #                             value_vars,
+    #                             results_folder,
+    #                             deseasonalise_output=deseasonalise_output,
+    #                             practice_correction=practice_correction,
+    #                             min_practice_obs=min_practice_obs,
+    #                             n_jobs=n_jobs)
 
+    compare_individual_analyses(results_root)
     status("Script complete.")

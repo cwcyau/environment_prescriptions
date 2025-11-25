@@ -1,0 +1,144 @@
+hydro_rain_values
+  pred: -0.009 (CI: -0.010, -0.008),  p=2.63e-34
+  imd:  0.044 (CI: 0.038, 0.051),  p=5.23e-44
+  int:  0.005 (CI: 0.004, 0.006),  p=1.03e-12
+  RE intercept ~ IMD slope: -0.027
+  RE slope     ~ IMD slope: 0.012
+  error: None
+
+met_rain_values
+  pred: -0.010 (CI: -0.012, -0.009),  p=1.48e-41
+  imd:  0.018 (CI: 0.012, 0.023),  p=3.06e-10
+  int:  0.004 (CI: 0.002, 0.005),  p=1.4e-06
+  RE intercept ~ IMD slope: -0.006
+  RE slope     ~ IMD slope: 0.016
+  error: None
+
+met_tmax_values
+  pred: 0.048 (CI: 0.043, 0.053),  p=6.67e-88
+  imd:  0.016 (CI: 0.010, 0.021),  p=1.46e-08
+  int:  -0.001 (CI: -0.002, 0.000),  p=0.155
+  RE intercept ~ IMD slope: -0.006
+  RE slope     ~ IMD slope: 0.016
+  error: None
+
+met_tmin_values
+  pred: 0.040 (CI: 0.036, 0.045),  p=9.22e-70
+  imd:  0.016 (CI: 0.011, 0.022),  p=4.5e-09
+  int:  -0.000 (CI: -0.002, 0.001),  p=0.512
+  RE intercept ~ IMD slope: -0.006
+  RE slope     ~ IMD slope: 0.016
+  error: None
+
+aqrean_carbon_monoxide_values
+  pred: 0.026 (CI: 0.024, 0.028),  p=1.03e-138
+  imd:  0.008 (CI: 0.001, 0.015),  p=0.0206
+  int:  0.003 (CI: 0.001, 0.005),  p=0.000845
+  RE intercept ~ IMD slope: 0.004
+  RE slope     ~ IMD slope: 0.016
+  error: None
+
+aqrean_daqi_overall_values
+  pred: -0.013 (CI: -0.015, -0.011),  p=8.19e-46
+  imd:  0.004 (CI: -0.003, 0.011),  p=0.237
+  int:  0.003 (CI: 0.001, 0.004),  p=8.96e-05
+  RE intercept ~ IMD slope: 0.004
+  RE slope     ~ IMD slope: 0.016
+  error: None
+
+aqrean_nitrogen_monoxide_values
+  pred: 0.006 (CI: 0.003, 0.008),  p=3.03e-06
+  imd:  0.005 (CI: -0.002, 0.012),  p=0.181
+  int:  -0.002 (CI: -0.003, 0.000),  p=0.066
+  RE intercept ~ IMD slope: 0.003
+  RE slope     ~ IMD slope: 0.015
+  error: None
+
+aqrean_nitrogen_dioxide_values
+  pred: 0.016 (CI: 0.014, 0.019),  p=1.16e-30
+  imd:  0.006 (CI: -0.001, 0.013),  p=0.0717
+  int:  -0.003 (CI: -0.005, -0.001),  p=0.00905
+  RE intercept ~ IMD slope: 0.003
+  RE slope     ~ IMD slope: 0.014
+  error: None
+
+aqrean_daqi_nitrogen_dioxide_values
+  pred: -0.004 (CI: -0.006, -0.002),  p=3.56e-05
+  imd:  0.003 (CI: -0.003, 0.010),  p=0.328
+  int:  -0.001 (CI: -0.003, 0.000),  p=0.149
+  RE intercept ~ IMD slope: 0.003
+  RE slope     ~ IMD slope: 0.015
+  error: None
+
+aqrean_nox_expressed_as_nitrogen_dioxide_values
+  pred: 0.007 (CI: 0.004, 0.009),  p=8.93e-08
+  imd:  0.005 (CI: -0.002, 0.012),  p=0.159
+  int:  -0.002 (CI: -0.003, 0.000),  p=0.103
+  RE intercept ~ IMD slope: 0.003
+  RE slope     ~ IMD slope: 0.015
+  error: None
+
+aqrean_ozone_values
+  pred: -0.009 (CI: -0.011, -0.006),  p=5.18e-13
+  imd:  0.004 (CI: -0.003, 0.011),  p=0.214
+  int:  0.004 (CI: 0.002, 0.005),  p=1.95e-07
+  RE intercept ~ IMD slope: 0.003
+  RE slope     ~ IMD slope: 0.015
+  error: None
+
+aqrean_daqi_ozone_values
+  pred: -0.009 (CI: -0.011, -0.007),  p=2.06e-19
+  imd:  0.005 (CI: -0.002, 0.011),  p=0.196
+  int:  0.005 (CI: 0.003, 0.006),  p=7.89e-11
+  RE intercept ~ IMD slope: 0.003
+  RE slope     ~ IMD slope: 0.014
+  error: None
+
+aqrean_pm2p5_values
+  pred: 0.001 (CI: -0.000, 0.003),  p=0.123
+  imd:  0.004 (CI: -0.003, 0.011),  p=0.266
+  int:  0.000 (CI: -0.001, 0.002),  p=0.599
+  RE intercept ~ IMD slope: 0.003
+  RE slope     ~ IMD slope: 0.016
+  error: None
+
+aqrean_daqi_pm2p5_values
+  pred: -0.014 (CI: -0.016, -0.012),  p=1.6e-41
+  imd:  0.004 (CI: -0.003, 0.010),  p=0.315
+  int:  -0.001 (CI: -0.002, 0.001),  p=0.497
+  RE intercept ~ IMD slope: 0.003
+  RE slope     ~ IMD slope: 0.015
+  error: None
+
+aqrean_pm10_values
+  pred: 0.009 (CI: 0.007, 0.010),  p=1.29e-19
+  imd:  0.004 (CI: -0.003, 0.011),  p=0.23
+  int:  0.001 (CI: -0.001, 0.002),  p=0.22
+  RE intercept ~ IMD slope: 0.004
+  RE slope     ~ IMD slope: 0.016
+  error: None
+
+aqrean_daqi_pm10_values
+  pred: -0.015 (CI: -0.017, -0.013),  p=1.51e-48
+  imd:  0.003 (CI: -0.003, 0.010),  p=0.324
+  int:  0.000 (CI: -0.002, 0.002),  p=0.954
+  RE intercept ~ IMD slope: 0.003
+  RE slope     ~ IMD slope: 0.015
+  error: None
+
+aqrean_sulfur_dioxide_values
+  pred: -0.004 (CI: -0.006, -0.002),  p=3.17e-05
+  imd:  0.003 (CI: -0.004, 0.010),  p=0.369
+  int:  0.000 (CI: -0.002, 0.002),  p=0.717
+  RE intercept ~ IMD slope: 0.004
+  RE slope     ~ IMD slope: 0.016
+  error: None
+
+aqrean_daqi_sulfur_dioxide_values
+  pred: 0.000 (CI: -0.002, 0.002),  p=0.893
+  imd:  0.004 (CI: -0.003, 0.011),  p=0.26
+  int:  0.003 (CI: 0.001, 0.006),  p=0.00526
+  RE intercept ~ IMD slope: 0.003
+  RE slope     ~ IMD slope: 0.015
+  error: None
+
