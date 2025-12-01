@@ -1,5 +1,5 @@
 import xarray as xr
-from funcs import add_hydrology_flags, add_geojson_flood_flags, add_met_flags, load_json, add_particulate_flags, add_deprivation_index
+from funcs import add_hydrology_flags, add_geojson_flood_flags, add_met_flags, load_json, add_particulate_flags, add_deprivation_index, add_practice_regions
 
 # parameters
 append_flags = True  # set to True if appending flags to existing flagged files
@@ -14,7 +14,8 @@ prescriptions_paths = [
 # geojson_path = "data/Recorded_Flood_Outlines.geojson"
 # met_path = "data/met_office_stations.nc"
 # particulates_path = "data/particulates_by_practice_monthly_max.nc"
-deprivation_path = "data/local_authority_district_index_multiple_deprivation_centiles.nc"
+# deprivation_path = "data/local_authority_district_index_multiple_deprivation_centiles.nc"
+regions_path = "data/england_regions.geojson"
 
 # load datasets
 print("Loading datasets...")
@@ -22,7 +23,8 @@ print("Loading datasets...")
 # flood_geojson = load_json(geojson_path)
 # met_ds = xr.open_dataset(met_path)
 # particulates_ds = xr.load_dataset(particulates_path)
-deprivation_ds = xr.load_dataset(deprivation_path)
+# deprivation_ds = xr.load_dataset(deprivation_path)
+regions_geojson = load_json(regions_path)
 print("Datasets loaded.")
 
 # set seasonality suffix
@@ -57,8 +59,10 @@ for prescriptions_path in prescriptions_paths:
     # prescriptions_ds = add_met_flags(prescriptions_ds, met_ds, seasonal_correction=seasonal_correction)
     # print("  Adding Particulate flags...")
     # prescriptions_ds = add_particulate_flags(prescriptions_ds, particulates_ds, seasonal_correction=seasonal_correction)
-    print("  Adding deprivation data...")
-    prescriptions_ds = add_deprivation_index(prescriptions_ds, deprivation_ds)
+    # print("  Adding deprivation data...")
+    # prescriptions_ds = add_deprivation_index(prescriptions_ds, deprivation_ds)
+    print("  Adding Regions...")
+    prescriptions_ds = add_practice_regions(prescriptions_ds, regions_geojson)
 
     # save
     save_path = prescriptions_path.replace(suffix_old, suffix_new)

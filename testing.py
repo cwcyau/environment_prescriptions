@@ -1,12 +1,14 @@
-
+import numpy as np
+import pandas as pd
 import xarray as xr
+from funcs import load_json, plot_regions_map
 
-codes = ["02", "03", "0501", "02_03_0501"]
-for code in codes:
-    print('---------------', code)
-    ds = xr.open_dataset(f"data/prescriptions_{code}_2010-08_2025-08_with_flags.nc")
-    print([d for d in ds.data_vars if "imd_centile" in d])
-    ds = ds.rename({"imd_centile": "imd_centile_values"})
-    print([d for d in ds.data_vars if "imd_centile" in d])
-    ds.to_netcdf(f"data/prescriptions_{code}_2010-08_2025-08_with_flags_new.nc")
-    ds.close()
+ds = xr.open_dataset("data/prescriptions_02_03_0501_2010-08_2025-08_with_flags.nc")
+
+print(np.unique(ds["region"].values))
+print(len(ds['practice_id'].values))
+
+ds = ds.isel(practice_id=ds["region"] != "Wales")
+
+print(np.unique(ds["region"].values))
+print(len(ds['practice_id'].values))

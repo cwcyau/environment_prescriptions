@@ -1,28 +1,125 @@
 import xarray as xr
-from funcs import prepare_ds, run_all_flag_mixed_models, run_all_value_mixed_models, compare_individual_analyses, status
+from funcs import (
+    status,
+    prepare_ds,
+    run_mixed_effects_models,
+    compare_mixed_models,
+)
 
-# parameters
+def build_predictor_spec(flag_types, value_vars):
+    specs = []
+
+    for ft in flag_types:
+        # simple binary flood flag
+        if ft == "flood":
+            specs.append({
+                "name": ft,
+                "type": "binary_simple",
+                "var": ft,
+            })
+            continue
+
+        # weather flags with high/med/low flags
+        elif "aqrean" not in ft:
+            med  = f"{ft}_median"
+            # high vs median
+            high = f"{ft}_high"
+            specs.append({
+                "name": f"{ft}_high_vs_med",
+                "type": "binary_pair",
+                "var_anom": high,
+                "var_med":  med
+            })
+            # low vs median
+            low  = f"{ft}_low"
+            specs.append({
+                "name": f"{ft}_low_vs_med",
+                "type": "binary_pair",
+                "var_anom": low,
+                "var_med":  med
+            })
+        
+        # pollutant flags with high flag only
+        elif "daqi" not in ft:
+            high = f"{ft}_high"
+            specs.append({
+                "name": f"{ft}_high_vs_not",
+                "type": "binary_simple",
+                "var": high
+            })
+
+        # DAQI flags:
+        # pair1: (very high, high) vs (moderate, low)
+        # pair2: (very high, high, moderate) vs (low)
+        else:
+            daqi_vars = {
+                "very_high": f"{ft}_very_high",
+                "high":      f"{ft}_high",
+                "moderate":  f"{ft}_moderate",
+                "low":       f"{ft}_low"
+            }
+            specs.append({
+                "name": f"{ft}_daqipair1",
+                "type": "daqi_pair1",
+                "vars": daqi_vars
+            })
+            specs.append({
+                "name": f"{ft}_daqipair2",
+                "type": "daqi_pair2",
+                "vars": daqi_vars
+            })
+
+    for v in value_vars:
+        # continuous value model
+        specs.append({
+            "name": v,
+            "type": "continuous",
+            "var": v
+        })
+
+    return specs
+
+
+# Test Parameters =================================================================================
+# min_practice_obs = 20  # practices with fewer points will be excluded
+# n_jobs = 12  # number of parallel jobs to run
+# n_practices = 1000  # limit to n randomly selected practices (None for all practices)
+# practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope (keep as 2 as runs within walltime)
+# deseasonalise_output = True  # whether to include a seasonal correction term for output variable (items) (always True as adding seasonal term is inexpensive)
+# deseasonalise_predictors = False  # whether to apply seasonal correction to predictor variables
+# adjust_predictors = 'z-global'  # 'z-global': standardise values globally, 'z-practice': standardise per practice, 'c-global': centre globally, 'c-practice': centre per practice, None: raw values
+# standardise_items = False  # KEEP FALSE AS USING LOG ITEMS NOW - whether to standardise items variable (per practice)
+# clean_items = True  # whether to clean 'items' by removing low values and practices with low means
+# practice_mean_thresh = 500  # threshold for defining large vs small practices
+# results_root = "outputs/mixed_effects_test/"
+# prescription_codes = ["02_03_0501"]
+# flag_types = [
+#     "hydro_rain",
+#     "flood",
+#     "aqrean_carbon_monoxide",
+#     "aqrean_daqi_overall",
+# ]
+# =================================================================================================
+
+# Runtime parameters ==============================================================================
 min_practice_obs = 20  # practices with fewer points will be excluded
 n_jobs = 12  # number of parallel jobs to run
-n_practices = None  # limit to n practices with most data points (for testing, set None to use all practices)
+n_practices = None  # limit to n randomly selected practices (None for all practices)
 practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope (keep as 2 as runs within walltime)
 deseasonalise_output = True  # whether to include a seasonal correction term for output variable (items) (always True as adding seasonal term is inexpensive)
 deseasonalise_predictors = False  # whether to apply seasonal correction to predictor variables
 adjust_predictors = 'z-global'  # 'z-global': standardise values globally, 'z-practice': standardise per practice, 'c-global': centre globally, 'c-practice': centre per practice, None: raw values
-standardise_items = True  # whether to standardise items variable (per practice)
+standardise_items = False  # KEEP FALSE AS USING LOG ITEMS NOW - whether to standardise items variable (per practice)
+clean_items = True  # whether to clean 'items' by removing low values and practices with low means
+practice_mean_thresh = 500  # threshold for defining large vs small practices
 results_root = "outputs/mixed_effects/"
-
-# codes to process
 prescription_codes = ["02_03_0501", "02", "03", "0501"]
-
-# base names of flags and values
-# e.g. hydro_rain for hydro_rain_high, hydro_rain_median, hydro_rain_low, hydro_rain_values
 flag_types = [
     "hydro_rain",
     "met_rain",
     "met_tmax",
     "met_tmin",
-    "flood", 
+    "flood",
     "aqrean_carbon_monoxide",
     "aqrean_daqi_overall",
     "aqrean_nitrogen_monoxide",
@@ -36,55 +133,54 @@ flag_types = [
     "aqrean_pm10",
     "aqrean_daqi_pm10",
     "aqrean_sulfur_dioxide",
-    "aqrean_daqi_sulfur_dioxide"
+    "aqrean_daqi_sulfur_dioxide",
 ]
+# =================================================================================================
 
-# set names of the variables containing raw values (not flags)
+# build list of continuous predictors and all model specifications
 value_vars = [ft + "_values" for ft in flag_types if ft != "flood"]
+predictors_spec = build_predictor_spec(flag_types, value_vars)
 
 if __name__ == "__main__":
-    # for codes in prescription_codes:
-    #     # set the path to get correct flags (generated from deseasonalised or non-deseasonalised values)
-    #     if deseasonalise_predictors:
-    #         input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags_deseasonalised.nc"
-    #     else:
-    #         input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags.nc"
-    #     results_folder = f"{results_root}{codes}/"
+    for codes in prescription_codes:
+        # ensure the correct input file is used
+        if deseasonalise_predictors:
+            input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags_deseasonalised.nc"
+        else:
+            input_path = f"data/prescriptions_{codes}_2010-08_2025-08_with_flags.nc"
+        results_folder = f"{results_root}{codes}/"
 
-    #     # get the data and set save folder
-    #     status(f"Processing file: {input_path}")
-    #     ds = xr.load_dataset(input_path)
-    #     ds = prepare_ds(ds,
-    #                     n_practices=n_practices,
-    #                     standardise_items=standardise_items,
-    #                     adjust_predictors=adjust_predictors,
-    #                     deseasonalise_predictors=deseasonalise_predictors)
+        # prepare data for modelling
+        status(f"=====     Processing prescription code: {codes}     =====")
+        status(f"Preparing dataset for file: {input_path}")
+        ds = xr.load_dataset(input_path)
+        ds = prepare_ds(
+            ds,
+            n_practices=n_practices,
+            standardise_items=standardise_items,
+            clean_items=clean_items,
+            adjust_predictors=adjust_predictors,
+            deseasonalise_predictors=deseasonalise_predictors,
+            practice_mean_thresh=practice_mean_thresh,
+        )
 
-    #     # run mixed models comparing flags
-    #     # compares:
-    #     #    flooding: flood == 1 to flood == 0
-    #     #    met and hydro: high/low to median periods
-    #     #    particulate mass: high == 1 to high == 0
-    #     #    particulate DAQI: (very high, high) to (moderate, low) and (very high, high, moderate) to (low)
-    #     status(f"Running mixed-effects models for flags...")
-    #     run_all_flag_mixed_models(ds,
-    #                             flag_types,
-    #                             results_folder,
-    #                             deseasonalise_output=deseasonalise_output,
-    #                             practice_correction=practice_correction,
-    #                             min_practice_obs=min_practice_obs,
-    #                             n_jobs=n_jobs,)
+        # run all mixed-effects models for this prescription type
+        status("Running unified mixed-effects models...")
+        run_mixed_effects_models(
+            ds,
+            predictors_spec,
+            results_folder,
+            deseasonalise_output=deseasonalise_output,
+            practice_correction=practice_correction,
+            min_practice_obs=min_practice_obs,
+            n_jobs=n_jobs
+        )
+    
+    # compare and plot results across prescription types
+    status("Comparing mixed-effects model results across prescription types...")
+    compare_mixed_models(
+        results_folder=f"{results_root}",
+        save_folder=f"{results_root}",
+    )
 
-    #     # run mixed models using raw measurements
-    #     # handles all variables except for flooding, as there are no values for this
-    #     status(f"Running mixed-effects models for values...")
-    #     run_all_value_mixed_models(ds,
-    #                             value_vars,
-    #                             results_folder,
-    #                             deseasonalise_output=deseasonalise_output,
-    #                             practice_correction=practice_correction,
-    #                             min_practice_obs=min_practice_obs,
-    #                             n_jobs=n_jobs)
-
-    compare_individual_analyses(results_root)
-    status("Script complete.")
+    status("All analyses complete.")

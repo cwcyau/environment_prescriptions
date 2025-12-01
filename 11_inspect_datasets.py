@@ -35,4 +35,4 @@ for prescriptions_path in prescriptions_paths:
     if not priors_done:
         plot_prior_distributions(ds)
         priors_done = True
-    # plot_practices(ds, prescriptions_path, flag_types=flag_types, seed=seed)
+    plot_practices(ds, prescriptions_path, flag_types=flag_types, seed=seed)

@@ -1,5 +1,3 @@
-from funcs import compare_individual_analyses, compare_bayesian_analyses, compare_bayesian_spline_analyses, status, generate_bayesian_diagnostics
+from funcs import compare_mixed_models, compare_bayesian_models, compare_bayesian_spline_analyses, generate_bayesian_diagnostics
 
-compare_bayesian_analyses("outputs/bayes_standard/")
-# compare_bayesian_spline_analyses("outputs/bayes_splines/")
-# generate_bayesian_diagnostics("outputs/bayes_splines/")
+compare_bayesian_models("outputs/bayes_standard/")

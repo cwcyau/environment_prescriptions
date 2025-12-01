@@ -6,3 +6,4 @@ __pycache__/
 notes.txt
 temp/
 data/deprivation_indices/indices-of-deprivation-2025.csv
+upload.py
