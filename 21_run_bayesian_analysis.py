@@ -3,7 +3,7 @@
 # import os, jax
 # import xarray as xr
 # from funcs import (
-#     prepare_ds, run_bayesian_model, compare_bayesian_models, status, run_bayesian_model_gpu
+#     prepare_ds, run_bayesian_model, compare_bayesian_models, status
 # )
 # os.environ["PYTENSOR_FLAGS"] = "mode=NUMBA"
 # method = "standard"
@@ -19,7 +19,6 @@
 # tune = 100
 # chains = 8
 # cores = 8
-# use_gpu = False
 # deseasonalise_predictors = False  # whether to apply seasonal correction to predictor variables
 # adjust_predictors = 'z-global'  # 'z-global': standardise values globally, 'z-practice': standardise per practice, 'c-global': centre globally, 'c-practice': centre per practice, None: raw values
 # standardise_items = False  # KEEP FALSE AS USING LOG ITEMS NOW - whether to standardise items variable (per practice)
@@ -42,7 +41,7 @@
 import xarray as xr, jax
 import argparse
 from funcs import (
-    prepare_ds, run_bayesian_model, compare_bayesian_models, status, run_bayesian_model_gpu
+    prepare_ds, run_bayesian_model, compare_bayesian_models, status
 )
 
 # parse command line arguments
@@ -61,9 +60,6 @@ parser.add_argument("--cores", type=int, default=8,
                     help="Number of CPU cores to use (default: 8).")
 parser.add_argument("--n_practices", type=int, default=None,
                     help="Limit to n randomly selected practices (None for all practices).")
-parser.add_argument("--use_gpu", action="store_true", help="Use GPU")
-parser.add_argument("--no_gpu",  action="store_false", dest="use_gpu", help="Disable GPU")
-parser.set_defaults(use_gpu=True)
 args = parser.parse_args()
 lag = args.lag
 prescription_code = args.prescription_code
@@ -74,7 +70,6 @@ if n_practices == 0:
     n_practices = None
 chains = args.chains
 cores = args.cores
-use_gpu = args.use_gpu
 
 # data preparation parameters
 # n_practices = None  # limit to n randomly selected practices (None for all practices)
@@ -85,10 +80,11 @@ deseasonalise_predictors = False  # whether to apply seasonal correction to pred
 practice_mean_thresh = 500  # threshold for defining large vs small practices
 
 # modelling parameters
-min_obs_per_practice = 25  # practices with fewer points will be excluded (after all rows in final df with nans have been removed)
-almon_order = 2  # order of almon lag polynomial (only used if lag > 0)
+min_obs_per_practice = 20  # practices with fewer points will be excluded (after all rows in final df with nans have been removed)
+almon_order = 1  # order of almon lag polynomial (only used if lag > 0)
 practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope, 3 = intercept + slope + correlation (keep as 2 as runs within walltime)
 deseasonalise_output = True  # whether to include a seasonal correction term for output variable (items) (always True as adding seasonal term is inexpensive)
+likelihood = "studentt"  # likelihood to use: "normal" or "studentt"
 # draws = 2000  # number of MCMC draws
 # tune = 2000  # number of tuning steps
 # chains = 8  # number of MCMC chains
@@ -151,13 +147,29 @@ if __name__ == "__main__":
     # set files/folder paths
     prescriptions_path = f"data/prescriptions_{prescription_code}_2010-08_2025-08_with_flags.nc"
     status("Starting Bayesian analysis script...")
-    status(f"data path: {prescriptions_path}", level=1)
-    status(f"results folder: {results_folder}", level=1)
-    status(f"lag: {lag}, almon order: {almon_order}", level=1)
-    status(f"tune: {tune}, draws: {draws}, chains: {chains}, cores: {cores}", level=1)
-    status(f"n_practices: {n_practices}", level=1)
-    status(f"use_gpu: {use_gpu}", level=1)
-    status(f"predictors: {predictors}", level=1)
+    status("System parameters:", level=1)
+    status(f"data path: {prescriptions_path}", level=2)
+    status(f"results folder: {results_folder}", level=2)
+    status(f"tune: {tune},", level=2)
+    status(f"draws: {draws},", level=2)
+    status(f"chains: {chains},", level=2)
+    status(f"cores: {cores}", level=2)
+    status("Model parameters:", level=1)
+    status(f"lag: {lag},", level=2)
+    status(f"almon order: {almon_order}", level=2)
+    status(f"min_obs_per_practice: {min_obs_per_practice}", level=2)
+    status(f"practice_correction: {practice_correction}", level=2)
+    status(f"deseasonalise_output: {deseasonalise_output}", level=2)
+    status(f"likelihood: {likelihood}", level=2)
+    status("Data preparation parameters:", level=1)
+    status(f"n_practices: {n_practices},", level=2)
+    status(f"standardise_items: {standardise_items},", level=2)
+    status(f"clean_items: {clean_items},", level=2)
+    status(f"adjust_predictors: {adjust_predictors},", level=2)
+    status(f"deseasonalise_predictors: {deseasonalise_predictors},", level=2)
+    status(f"practice_mean_thresh: {practice_mean_thresh}", level=2)
+    status("Predictor variables:", level=1)
+    [status(f"{predictor}", level=2) for predictor in predictors]
 
     # collect and prepare the dataset
     status(f"Preparing dataset...")
@@ -172,40 +184,23 @@ if __name__ == "__main__":
 
     # run the bayesian models
     status("Initialising model run...")
-    if use_gpu:
-        jax.config.update("jax_platform_name", "gpu")
-        status(f"Using device: {jax.devices()[0]}", level=1)
-        run_bayesian_model_gpu(
-            ds,
-            raw_vars=predictors,
-            results_folder=results_folder,
-            lag=lag,
-            almon_order=almon_order,
-            deseasonalise_output=deseasonalise_output,
-            practice_correction=practice_correction,
-            min_practice_obs=min_obs_per_practice,
-            draws=draws,
-            tune=tune,
-            chains=chains,
-            cores=cores,
-        )
-    else:
-        jax.config.update("jax_platform_name", "cpu")
-        status(f"Using device: {jax.devices()[0]}", level=1)
-        run_bayesian_model(
-            ds,
-            raw_vars=predictors,
-            results_folder=results_folder,
-            lag=lag,
-            almon_order=almon_order,
-            deseasonalise_output=deseasonalise_output,
-            practice_correction=practice_correction,
-            min_practice_obs=min_obs_per_practice,
-            draws=draws,
-            tune=tune,
-            chains=chains,
-            cores=cores,
-        )
+    jax.config.update("jax_platform_name", "gpu")
+    status(f"Using device: {jax.devices()[0]}", level=1)
+    run_bayesian_model(
+        ds,
+        raw_vars=predictors,
+        results_folder=results_folder,
+        lag=lag,
+        almon_order=almon_order,
+        deseasonalise_output=deseasonalise_output,
+        practice_correction=practice_correction,
+        min_practice_obs=min_obs_per_practice,
+        likelihood=likelihood,
+        draws=draws,
+        tune=tune,
+        chains=chains,
+        cores=cores,
+    )
 
     # running model comparisons
     status("Comparing model results...")

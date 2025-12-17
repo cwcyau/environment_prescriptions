@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 # import bambi as bmb
 import arviz as az
-# import xarray as xr
+import xarray as xr
 import statsmodels.formula.api as smf
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
@@ -13,8 +13,10 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import pymc as pm
-import pytensor.tensor as pt
+# import pytensor.tensor as pt
+import scipy.sparse as sp
 # from time import perf_counter
+from numpy.linalg import qr
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from matplotlib.cm import ScalarMappable
 # from datetime import datetime, timedelta
@@ -1161,12 +1163,13 @@ def run_bayesian_model(
     ds,
     raw_vars: list,
     results_folder: str,
-    practice_categories: list = ["region", "practice_size"],
     lag: int = 0,
     almon_order: int = 2,
+    individual_priors: bool = True,
     deseasonalise_output: bool = True,
     practice_correction: int = 1,
     min_practice_obs: int = 20,
+    likelihood: str = "normal",
     draws: int = 2000,
     tune: int = 2000,
     chains: int = 4,
@@ -1183,19 +1186,20 @@ def run_bayesian_model(
         List of predictor variable names (strings) in ds to include in the model.
     results_folder : str
         Directory where CSV and traceplot outputs will be saved.
-    practice_categories : list
-        List of practice-level categorical covariates to include as fixed effects.
     lag : int
         Number of lagged months to include for each predictor variable.
     almon_order : int
         Order of Almon lag polynomial to use if lag > 0.
+    individual_priors : bool
+        Use individual priors per predictor variable based on their stddev. Single Normal(0, 2) prior otherwise.
     deseasonalise_output : bool
         Include month fixed effects to deseasonalise output.
     practice_correction : int
-        0 = no random effects, 1 = random intercept, 2 = random intercept
-        + slope on date_code.
+        0 = no random effects, 1 = random intercept, 2 = random intercept + slope on date_code.
     min_practice_obs : int
         Minimum monthly observations per practice required.
+    likelihood : str
+        Likelihood to use: "normal" or "studentt".
     draws : int
         Number of MCMC draws per chain.
     tune : int
@@ -1209,7 +1213,7 @@ def run_bayesian_model(
 
     # prepare dataframe ===========================================================================
     status("Preparing dataframe for model input...", level=1)
-    df = ds[["items", "date_code"] + raw_vars + practice_categories].to_dataframe().reset_index()
+    df = ds[["items", "date_code", "region", "practice_size"] + raw_vars].to_dataframe().reset_index()
     df["date"] = pd.to_datetime(df["date"])
     df["month"] = df["date"].dt.month
     df = df.rename(columns={"items": "items_raw"})
@@ -1236,7 +1240,9 @@ def run_bayesian_model(
         # create Almon bases
         status(f"Creating almon lag basis of order {almon_order}...", level=1)
         def almon_weights(lags, order):
-            return np.vstack([lags**k for k in range(order+1)]).T
+            X = np.vstack([lags**k for k in range(order+1)]).T
+            Q, _ = qr(X)
+            return Q
         lag_basis = np.arange(lag+1)
         almon_X = almon_weights(lag_basis, almon_order)
 
@@ -1251,11 +1257,6 @@ def run_bayesian_model(
     # identify continuous and categorical predictors
     continuous_vars = raw_vars.copy()
     categorical_vars = []
-    # if "flood" in continuous_vars:
-    #     continuous_vars.remove("flood")
-    #     categorical_vars.append("flood")
-    for cov in practice_categories:
-        categorical_vars.append(cov)
     if deseasonalise_output:
         categorical_vars.append("month")
 
@@ -1263,18 +1264,11 @@ def run_bayesian_model(
     cat_code_maps = {}
     for cat in categorical_vars:
         # reference category at end of categories list
-        if cat == "region":
-            cat_code_maps[cat] = pd.Categorical(df[cat], categories=REGION_NAMES)
-        elif cat == "practice_size":
-            cat_code_maps[cat] = pd.Categorical(df[cat], categories=PRACTICE_SIZES)
-        elif cat == "month":
+        if cat == "month":
             ref = "September"
             num_ref = MONTHS.index(ref) + 1
             categories = [m for m in range(1, 13) if m != num_ref] + [num_ref]
             cat_code_maps[cat] = pd.Categorical(df[cat], categories=categories)
-        # elif cat == "flood":
-        #     flood_cats = [1, 0]
-        #     cat_code_maps[cat] = pd.Categorical(df[cat], categories=flood_cats)  # 0 as reference
         else:
             cat_code_maps[cat] = pd.Categorical(df[cat])
 
@@ -1286,444 +1280,158 @@ def run_bayesian_model(
         if missing:
             status(f"Warning: for categorical {cat}, these levels were NOT present in data: {missing}", level=1)
 
-    # prepare dataframe for dropping collinear columns
-    design_df = pd.DataFrame(index=df.index)
-    if lag == 0:
-        for var in continuous_vars:
-            design_df[var] = df[var].values
-    else:
-        for var in continuous_vars:
-            for j in range(almon_order + 1):
-                colname = f"{var}_almon_basis_{j}"
-                design_df[colname] = df[colname].values
-
-    # drop collinear columns from df
-    kept_cols, dropped_cols = drop_collinear_cols(design_df)
-    if dropped_cols:
-        status(f"Dropping collinear columns: {dropped_cols}", level=1)
-    df.drop(columns=dropped_cols, inplace=True)
-
-    # standard deviations for priors
-    items_mean = df["items_log"].mean()
-    items_std = df["items_log"].std()
-    predictor_sds = {}
-    for col in kept_cols:
-        sd = df[col].std()
-        predictor_sds[col] = sd if sd > 0 else 1.0
-
-    # run model ===================================================================================
-    status("Running model...", level=1)
-    with pm.Model() as model:
-        # intercept prior
-        intercept = pm.Normal("Intercept", mu=items_mean, sigma=2 * items_std)
-
-        # practice random effects
-        practice_idx = pd.Categorical(df["practice_id"]).codes
-        n_practice = df["practice_id"].nunique()
-        if practice_correction == 1:
-            sigma_intercept = pm.HalfNormal("sigma_intercept", 1.0)
-            intercept_re_offset = pm.Normal("intercept_re_offset", 0.0, 1.0, shape=n_practice)
-            intercept_re = pm.Deterministic("intercept_re", intercept_re_offset * sigma_intercept)
-            practice_map = {pid: i for i, pid in enumerate(valid_practices)}
-            practice_intercept = intercept_re[practice_idx]
-            practice_slope = 0.0
-
-        elif practice_correction == 2:
-            sigma_intercept = pm.HalfNormal("sigma_intercept", 1.0)
-            intercept_re_offset = pm.Normal("intercept_re_offset", 0.0, 1.0, shape=n_practice)
-            intercept_re = pm.Deterministic("intercept_re", intercept_re_offset * sigma_intercept)
-
-            sigma_slope = pm.HalfNormal("sigma_slope", 0.1)
-            slope_re_offset = pm.Normal("slope_re_offset", 0.0, 1.0, shape=n_practice)
-            slope_re = pm.Deterministic("slope_re", slope_re_offset * sigma_slope)
-
-            practice_map = {pid: i for i, pid in enumerate(valid_practices)}
-            practice_intercept = intercept_re[practice_idx]
-            practice_slope = slope_re[practice_idx] * df["date_code"].values
-
-        elif practice_correction == 3:
-            packed_chol, corr, sd_dist = pm.LKJCholeskyCov(
-                "practice_chol_pack", n=2, eta=2.0, sd_dist=pm.HalfNormal.dist(1.0)
-            )
-            chol = pm.expand_packed_triangular(2, packed_chol)
-            re_offset = pm.Normal("practice_re_offset", 0.0, 1.0, shape=(len(valid_practices), 2))
-            re = pm.Deterministic("practice_re", pm.math.dot(re_offset, chol.T))
-
-            practice_map = {pid: i for i, pid in enumerate(valid_practices)}
-            practice_idx = df["practice_id"].map(practice_map).values
-            practice_intercept = re[practice_idx, 0]
-            practice_slope = re[practice_idx, 1] * df["date_code"].values
-
-        else:
-            practice_intercept = 0.0
-            practice_slope = 0.0
-
-        eta = intercept + practice_intercept + practice_slope
-
-        # continuous predictors
-        if lag == 0:
-            for var in continuous_vars:
-                if var not in predictor_sds:
-                    continue
-                coef = pm.Normal(var, mu=0.0, sigma=2 * predictor_sds[var])
-                eta += coef * df[var].values
-        else:
-            for var in continuous_vars:
-                basis_cols = [f"{var}_almon_basis_{j}" for j in range(almon_order + 1)]
-                kept_basis = [c for c in basis_cols if c in predictor_sds]
-                if not kept_basis:
-                    continue
-
-                sigma_vec = np.array([2.0 * predictor_sds[c] for c in kept_basis])
-                coef = pm.Normal(f"{var}_almon", mu=0.0, sigma=sigma_vec, shape=len(kept_basis))
-
-                lagged_vals = df[[f"{var}_lag{l}" for l in range(lag+1)]].values
-                full_M = lagged_vals @ almon_X
-                kept_indices = [int(c.split("_")[-1]) for c in kept_basis]
-                M_reduced = full_M[:, kept_indices]
-                eta += M_reduced @ coef
-                full_coef = pt.zeros(almon_order + 1)
-                for j, basis_idx in enumerate(kept_indices):
-                    full_coef = pt.set_subtensor(full_coef[basis_idx], coef[j])
-                pm.Deterministic(f"{var}_lag_effects", almon_X @ full_coef)
-
-        # categorical predictors
-        for cat in categorical_vars:
-            codes = pd.Categorical(df[cat]).codes
-            n_levels = len(cat_code_maps[cat].categories)
-            n_levels_nonref = n_levels - 1
-            if n_levels_nonref <= 0:
-                continue
-            effect = pm.Normal(f"{cat}_effect", mu=0, sigma=2 * items_std, shape=n_levels_nonref)
-            non_ref_mask = codes != n_levels_nonref
-            eta += pm.math.switch(non_ref_mask, effect[codes.clip(0, n_levels_nonref-1)], 0)
-
-        # residual
-        sigma = pm.Exponential("sigma", 1.0)
-        pm.Normal("items_obs", mu=eta, sigma=sigma, observed=df["items_log"].values)
-
-        # sampling
-        idata = pm.sample(
-            draws=draws,
-            tune=tune,
-            chains=chains,
-            cores=cores,
-            target_accept=0.90,
-            # nuts_sampler="numpyro",
-            # nuts_sampler_kwargs={"chain_method": "vectorized"},
-        )
-
-    # save inference data =========================================================================
-    # posterior predictive sampling
-    status("Generating posterior predictive samples for PPC...", level=1)
-    idata_pp = pm.sample_posterior_predictive(idata, model=model, var_names=["items_obs"])
-    idata.extend(idata_pp)
-
-    # drop unnecessary groups
-    drop_groups = ["log_likelihood", "prior", "prior_predictive", "constant_data", "sample_stats_prior"]
-    for group in drop_groups:
-        if group in idata.groups():
-            del idata[group]
-
-    # save posterior summary with categorical names
-    summary_df = az.summary(idata, hdi_prob=0.95)
-    for cat in categorical_vars:
-        categories = list(cat_code_maps[cat].categories)
-        if cat == "month":  # map numeric month categories to names for month
-            categories = [MONTHS[i - 1] if 1 <= i <= 12 else str(i) for i in categories]
-        # if cat == "flood":  # map flood categories to names
-        #     categories = ["1", "0"]
-        for i, name in enumerate(categories):
-            col_name = f"{cat}_effect[{i}]"
-            if col_name in summary_df.index:
-                summary_df = summary_df.rename(index={col_name: f"{cat}_effect[{name}]"})
-    summary_df['mean_pct'] = 100 * (np.exp(summary_df['mean']) - 1)
-    summary_df['hdi_2.5pc_pct'] = 100 * (np.exp(summary_df['hdi_2.5%']) - 1)
-    summary_df['hdi_97.5pc_pct'] = 100 * (np.exp(summary_df['hdi_97.5%']) - 1)
-    summary_df = summary_df.reset_index()
-    summary_csv = os.path.join(results_folder, "bayesian_model_summary.csv")
-    summary_df.to_csv(summary_csv, index=False)
-    status(f"Posterior summary saved to: {summary_csv}", level=1)
-
-    # save full inference data
-    idata_path = os.path.join(results_folder, "bayesian_model_idata.nc")
-    az.to_netcdf(idata, idata_path)
-    status(f"Model results saved to: {idata_path}", level=1)
-
-    # generate diagnostics
-    status("Generating Bayesian diagnostic plots...", level=1)
-    generate_bayesian_diagnostics(idata, results_folder)
-
-    return model, idata
-
-def run_bayesian_model_gpu(
-    ds,
-    raw_vars: list,
-    results_folder: str,
-    practice_categories: list = ["region", "practice_size"],
-    lag: int = 0,
-    almon_order: int = 2,
-    deseasonalise_output: bool = True,
-    practice_correction: int = 1,
-    min_practice_obs: int = 20,
-    draws: int = 2000,
-    tune: int = 2000,
-    chains: int = 4,
-    cores: int = 4,
-):
-    """
-    Fit a hierarchical Bayesian model of prescription 'items' with optional lagged predictors.
-
-    Parameters
-    ----------
-    ds : xarray.Dataset
-        Dataset containing monthly 'items', date_code, practice covariates and the predictor variables.
-    raw_vars : list
-        List of predictor variable names (strings) in ds to include in the model.
-    results_folder : str
-        Directory where CSV and traceplot outputs will be saved.
-    practice_categories : list
-        List of practice-level categorical covariates to include as fixed effects.
-    lag : int
-        Number of lagged months to include for each predictor variable.
-    almon_order : int
-        Order of Almon lag polynomial to use if lag > 0.
-    deseasonalise_output : bool
-        Include month fixed effects to deseasonalise output.
-    practice_correction : int
-        0 = no random effects, 1 = random intercept, 2 = random intercept
-        + slope on date_code.
-    min_practice_obs : int
-        Minimum monthly observations per practice required.
-    draws : int
-        Number of MCMC draws per chain.
-    tune : int
-        Number of tuning steps per chain.
-    chains : int
-        Number of MCMC chains.
-    cores : int
-        Number of CPU cores to use.
-    """
-    os.makedirs(results_folder, exist_ok=True)
-
-    # prepare dataframe ===========================================================================
-    status("Preparing dataframe for model input...", level=1)
-    df = ds[["items", "date_code"] + raw_vars + practice_categories].to_dataframe().reset_index()
-    df["date"] = pd.to_datetime(df["date"])
-    df["month"] = df["date"].dt.month
-    df = df.rename(columns={"items": "items_raw"})
-    df["items_log"] = np.log1p(df["items_raw"])
-    df = df.dropna(subset=["items_log"] + raw_vars).copy()
-
-    # filter practices
-    practice_counts = df.groupby('practice_id').size()
-    min_practice_obs += lag  # need extra obs for lagged vars
-    valid_practices = practice_counts[practice_counts >= min_practice_obs].index
-    df = df[df['practice_id'].isin(valid_practices)]
-    if df.empty:
-        raise ValueError("no practices with sufficient observations after filtering")
-    status(f"Using {len(valid_practices)} practices with >= {min_practice_obs} observations", level=1)
-
-    # generate lagged variables if lag > 0
-    if lag > 0:
-        status(f"Creating lagged variables up to lag {lag}...", level=1)
-        for var in raw_vars:
-            for l in range(lag+1):
-                df[f"{var}_lag{l}"] = df.groupby("practice_id")[var].shift(l)
-        df = df.dropna(subset=[f"{v}_lag{l}" for v in raw_vars for l in range(lag+1)])
-
-        # create Almon bases
-        status(f"Creating almon lag basis of order {almon_order}...", level=1)
-        def almon_weights(lags, order):
-            return np.vstack([lags**k for k in range(order+1)]).T
-        lag_basis = np.arange(lag+1)
-        almon_X = almon_weights(lag_basis, almon_order)
-
-        # create Almon-basis columns for each variable
-        for var in raw_vars:
-            lagged_vals = df[[f"{var}_lag{l}" for l in range(lag+1)]].values
-            M = lagged_vals @ almon_X
-            for j in range(M.shape[1]):
-                colname = f"{var}_almon_basis_{j}"
-                df[colname] = M[:, j]
-
-    # identify continuous and categorical predictors
-    continuous_vars = raw_vars.copy()
-    categorical_vars = []
-    # if "flood" in continuous_vars:
-    #     continuous_vars.remove("flood")
-    #     categorical_vars.append("flood")
-    for cov in practice_categories:
-        categorical_vars.append(cov)
-    if deseasonalise_output:
-        categorical_vars.append("month")
-
-    # map categorical codes for CSV later
-    cat_code_maps = {}
-    for cat in categorical_vars:
-        # reference category at end of categories list
-        if cat == "region":
-            cat_code_maps[cat] = pd.Categorical(df[cat], categories=REGION_NAMES)
-        elif cat == "practice_size":
-            cat_code_maps[cat] = pd.Categorical(df[cat], categories=PRACTICE_SIZES)
-        elif cat == "month":
-            ref = "September"
-            num_ref = MONTHS.index(ref) + 1
-            categories = [m for m in range(1, 13) if m != num_ref] + [num_ref]
-            cat_code_maps[cat] = pd.Categorical(df[cat], categories=categories)
-        # elif cat == "flood":
-        #     flood_cats = [1, 0]
-        #     cat_code_maps[cat] = pd.Categorical(df[cat], categories=flood_cats)  # 0 as reference
-        else:
-            cat_code_maps[cat] = pd.Categorical(df[cat])
-
-    # warn for missing categories
-    for cat, cat_obj in cat_code_maps.items():
-        present = set(df[cat].unique())
-        expected = list(cat_obj.categories)
-        missing = [c for c in expected if c not in present]
-        if missing:
-            status(f"Warning: for categorical {cat}, these levels were NOT present in data: {missing}", level=1)
-
-    # prepare dataframe for dropping collinear columns
-    design_df = pd.DataFrame(index=df.index)
-    if lag == 0:
-        for var in continuous_vars:
-            design_df[var] = df[var].values
-    else:
-        for var in continuous_vars:
-            for j in range(almon_order + 1):
-                colname = f"{var}_almon_basis_{j}"
-                design_df[colname] = df[colname].values
-
-    # drop collinear columns from df
-    kept_cols, dropped_cols = drop_collinear_cols(design_df)
-    if dropped_cols:
-        status(f"Dropping collinear columns: {dropped_cols}", level=1)
-    df.drop(columns=dropped_cols, inplace=True)
-
-    # standard deviations for priors
-    items_mean = df["items_log"].mean()
-    items_std = df["items_log"].std()
-    predictor_sds = {}
-    for col in kept_cols:
-        sd = df[col].std()
-        predictor_sds[col] = sd if sd > 0 else 1.0
-
-    # convert all vars to pt =====================================================================
-    status("Converting data to pytorch tensors...", level=1)
-    # outcome and random effects
-    y_obs_pt = pt.constant(df["items_log"].values, dtype="float32")
-    practice_idx_pt = pt.constant(pd.Categorical(df["practice_id"]).codes, dtype="int32")
-    n_practice = int(df["practice_id"].nunique())
-    date_code_pt = pt.constant(df["date_code"].values, dtype="float32")
+    # precompute and combine design matrics =======================================================
+    status("Building combined design matrices...", level=1)
+    fixed_cols = []  # for column names in X_fixed
+    X_fixed_list = []  # list for numpy arrays in X_fixed
 
     # continuous predictors
-    X_cont_pt = {}
-    for var in continuous_vars:
-        if var in df:
-            X_cont_pt[var] = pt.constant(df[var].values, dtype="float32")
-
-    # lagged continuous predictors
-    M_reduced_pt = {}
-    kept_basis = {}
-    kept_indices = {}
-    if lag > 0:
-        almon_X_pt = pt.constant(almon_X, dtype="float32")
+    if lag == 0:
         for var in continuous_vars:
-            basis_cols = [f"{var}_almon_basis_{j}" for j in range(almon_order + 1)]
-            kept = [c for c in basis_cols if c in predictor_sds]
-            kept_basis[var] = kept
-            if not kept:
+            if var in df.columns:
+                fixed_cols.append(var)
+                X_fixed_list.append(df[var].values.astype("float32").reshape(-1, 1))
+    elif lag > 0:
+        M_all_list = []
+        for var in continuous_vars:
+            basis_cols = [
+                c for c in df.columns
+                if c.startswith(f"{var}_almon_basis_")
+            ]
+            if not basis_cols:
                 continue
-            lagged_vals = df[[f"{var}_lag{l}" for l in range(lag + 1)]].values
-            full_M = pt.constant(lagged_vals @ almon_X, dtype="float32")
-            indices = [int(c.split("_")[-1]) for c in kept]
-            kept_indices[var] = indices
-            M_reduced_pt[var] = full_M[:, indices]
+            M_var = df[basis_cols].values.astype("float32")
+            fixed_cols.extend(basis_cols)
+            M_all_list.append(M_var)
+        if M_all_list:
+            X_fixed_list.append(np.concatenate(M_all_list, axis=1).astype("float32"))
 
     # categorical predictors
-    cat_codes_pt = {}
-    n_cat_levels = {}
+    cat_col_slices = {}
     for cat in categorical_vars:
-        cat_codes_pt[cat] = pt.constant(pd.Categorical(df[cat]).codes, dtype="int32")
-        n_cat_levels[cat] = len(pd.Categorical(df[cat]).categories)
+        cat_obj = pd.Categorical(df[cat], categories=cat_code_maps[cat].categories)
+        levels = list(cat_obj.categories)
+        cat_codes = pd.get_dummies(cat_obj, prefix=cat, drop_first=False)
+        ref_level = levels[-1]
+        ref_col = f"{cat}_{ref_level}"
+        # keep only non-reference columns
+        nonref_cols = [c for c in cat_codes.columns if c != ref_col]
+        nonref_levels = [lvl for lvl in levels if lvl != ref_level]
+        cat_codes_nonref = cat_codes[nonref_cols]
+        fixed_cols.extend([f"{cat}[{lvl}]" for lvl in nonref_levels])
+        X_fixed_list.append(cat_codes_nonref.values.astype("float32"))
+        cat_col_slices[cat] = (len(fixed_cols) - cat_codes_nonref.shape[1], len(fixed_cols))
 
-    # build and run model =========================================================================
+    # standard deviations for priors
+    items_mean = df["items_log"].mean()
+    items_std = df["items_log"].std()
+    beta_sigma = np.array([
+        0.5 if ("almon_basis" in name or name not in continuous_vars)
+        else max(2.0 * df[name].std(), 1.0)
+        for name in fixed_cols
+    ], dtype="float32")
+
+    # prepare data arrays
+    X_fixed = np.concatenate(X_fixed_list, axis=1).astype("float32")
+    y_obs = df["items_log"].values.astype("float32")
+    practice_idx = pd.Categorical(df["practice_id"]).codes.astype("int32")
+    n_practice = int(df["practice_id"].nunique())
+    date_code = df["date_code"].values.astype("float32")
+
+    # prepare practice covariates
+    region_idx = pd.Categorical(df["region"], categories=REGION_NAMES).codes
+    size_idx = pd.Categorical(df["practice_size"], categories=PRACTICE_SIZES).codes
+    n_region = len(REGION_NAMES)
+    n_size = len(PRACTICE_SIZES)
+
+    # create and run the model ====================================================================
+    status("Running model...", level=1)
     with pm.Model() as model:
-        # intercept prior
+        # register data
+        X_fixed_data = pm.Data("X_fixed", X_fixed)
+        y_obs_data = pm.Data("y_obs", y_obs)
+        date_code_data = pm.Data("date_code", date_code)
+        practice_idx_data = pm.Data("practice_idx", practice_idx)
+        region_idx_data = pm.Data("region_idx", region_idx)
+        size_idx_data = pm.Data("size_idx", size_idx)
+
+        # global intercept
         intercept = pm.Normal("Intercept", mu=items_mean, sigma=2 * items_std)
 
-        # practice random effects
-        if practice_correction == 1:
-            sigma_intercept = pm.HalfNormal("sigma_intercept", 1.0)
-            intercept_re_offset = pm.Normal("intercept_re_offset", 0.0, 1.0, shape=n_practice)
-            intercept_re = pm.Deterministic("intercept_re", intercept_re_offset * sigma_intercept)
-            practice_intercept = intercept_re[practice_idx_pt]
-            practice_slope = 0.0
-
-        elif practice_correction == 2:
-            sigma_intercept = pm.HalfNormal("sigma_intercept", 1.0)
-            intercept_re_offset = pm.Normal("intercept_re_offset", 0.0, 1.0, shape=n_practice)
-            intercept_re = pm.Deterministic("intercept_re", intercept_re_offset * sigma_intercept)
-            sigma_slope = pm.HalfNormal("sigma_slope", 0.1)
+        # random effects
+        if practice_correction == 0:  # none
+            practice_intercept = 0.0
+            practice_slope_term = 0.0
+        elif practice_correction == 1:  # intercept only
+            # region-level intercepts
+            sigma_region = pm.HalfNormal("sigma_region", 0.3)
+            region_raw = pm.Normal("region_raw", 0.0, 1.0, shape=n_region)
+            region_mean = pm.Deterministic(
+                "region_mean",
+                (region_raw - region_raw.mean()) * sigma_region
+            )
+            # size-level intercepts
+            sigma_size = pm.HalfNormal("sigma_size", 0.3)
+            size_raw = pm.Normal("size_raw", 0.0, 1.0, shape=n_size)
+            size_mean = pm.Deterministic(
+                "size_mean",
+                (size_raw - size_raw.mean()) * sigma_size
+            )
+            # practice-level deviations (non-centred)
+            sigma_practice = pm.HalfNormal("sigma_practice", 0.5)
+            practice_offset = pm.Normal("practice_offset", 0.0, 1.0, shape=n_practice)
+            practice_intercept = (
+                region_mean[region_idx_data]
+                + size_mean[size_idx_data]
+                + practice_offset[practice_idx_data] * sigma_practice
+            )
+            practice_slope_term = 0.0
+        elif practice_correction == 2:  # intercept + slope
+            # region-level intercepts
+            sigma_region = pm.HalfNormal("sigma_region", 0.3)
+            region_raw = pm.Normal("region_raw", 0.0, 1.0, shape=n_region)
+            region_mean = pm.Deterministic(
+                "region_mean",
+                (region_raw - region_raw.mean()) * sigma_region
+            )
+            # size-level intercepts
+            sigma_size = pm.HalfNormal("sigma_size", 0.3)
+            size_raw = pm.Normal("size_raw", 0.0, 1.0, shape=n_size)
+            size_mean = pm.Deterministic(
+                "size_mean",
+                (size_raw - size_raw.mean()) * sigma_size
+            )
+            # practice-level deviations (non-centred)
+            sigma_practice = pm.HalfNormal("sigma_practice", 0.5)
+            practice_offset = pm.Normal("practice_offset", 0.0, 1.0, shape=n_practice)
+            practice_intercept = (
+                region_mean[region_idx_data]
+                + size_mean[size_idx_data]
+                + practice_offset[practice_idx_data] * sigma_practice
+            )
+            # practice-level slope deviations
+            sigma_slope = pm.HalfNormal("sigma_slope", 0.05)
             slope_re_offset = pm.Normal("slope_re_offset", 0.0, 1.0, shape=n_practice)
             slope_re = pm.Deterministic("slope_re", slope_re_offset * sigma_slope)
-            practice_intercept = intercept_re[practice_idx_pt]
-            practice_slope = slope_re[practice_idx_pt] * date_code_pt
+            practice_slope_term = slope_re[practice_idx_data] * date_code_data
 
-        elif practice_correction == 3:
-            packed_chol, corr, sd_dist = pm.LKJCholeskyCov(
-                "practice_chol_pack", n=2, eta=2.0, sd_dist=pm.HalfNormal.dist(1.0)
-            )
-            chol = pm.expand_packed_triangular(2, packed_chol)
-            re_offset = pm.Normal("practice_re_offset", 0.0, 1.0, shape=(n_practice, 2))
-            re = pm.Deterministic("practice_re", pm.math.dot(re_offset, chol.T))
-            practice_intercept = re[practice_idx_pt, 0]
-            practice_slope = re[practice_idx_pt, 1] * date_code_pt
-
+        # fixed effects
+        if individual_priors:
+            beta_sigma_data = pm.Data("beta_sigma", beta_sigma)
         else:
-            practice_intercept = 0.0
-            practice_slope = 0.0
-
-        eta = intercept + practice_intercept + practice_slope
-
-        # continuous predictors
-        if lag == 0:
-            for var in continuous_vars:
-                if var not in predictor_sds:
-                    continue
-                coef = pm.Normal(var, mu=0.0, sigma=2 * predictor_sds[var])
-                eta = eta + coef * X_cont_pt[var]
-        else:
-            for var in continuous_vars:
-                kept = kept_basis[var]
-                if not kept:
-                    continue
-                sigma_vec = pt.constant([2.0 * predictor_sds[b] for b in kept], dtype="float32")
-                coef = pm.Normal(f"{var}_almon", mu=0.0, sigma=sigma_vec, shape=len(kept))
-                M = M_reduced_pt[var]
-                eta = eta + pt.dot(M, coef)
-                full_coef = pt.zeros(almon_order + 1, dtype="float32")
-                for i, idx in enumerate(kept_indices[var]):
-                    full_coef = pt.set_subtensor(full_coef[idx], coef[i])
-                pm.Deterministic(f"{var}_lag_effects", pt.dot(almon_X_pt, full_coef))
-
-        # categorical predictors
-        for cat in categorical_vars:
-            codes_pt = cat_codes_pt[cat]
-            n_levels = n_cat_levels[cat]
-            n_nonref = n_levels - 1
-            if n_nonref <= 0:
-                continue
-            effect = pm.Normal(f"{cat}_effect", mu=0.0, sigma=2 * items_std, shape=n_nonref)
-            clipped = pt.clip(codes_pt, 0, n_nonref - 1)
-            non_ref_mask = pt.neq(codes_pt, n_levels - 1)  # use pt.neq for symbolic comparison
-            eta = eta + pt.switch(non_ref_mask, effect[clipped], 0.0)
+            beta_sigma_data = 2.0
+        beta = pm.Normal("beta", mu=0.0, sigma=beta_sigma_data, shape=X_fixed.shape[1])
+        eta = intercept + practice_intercept + practice_slope_term + pm.math.dot(X_fixed_data, beta)
 
         # residual
-        sigma = pm.Exponential("sigma", 1.0)
-        pm.Normal("items_obs", mu=eta, sigma=sigma, observed=y_obs_pt)
+        if likelihood == "normal":
+            sigma = pm.HalfNormal("sigma", 1.0)
+            pm.Normal("items_obs", mu=eta, sigma=sigma, observed=y_obs_data)
+        elif likelihood == "studentt":
+            sigma = pm.HalfNormal("sigma", 1.0)
+            pm.StudentT("items_obs", nu=4, mu=eta, sigma=sigma, observed=y_obs_data)
+        else:
+            raise ValueError("likelihood must be 'normal' or 'studentt'")
 
         # sampling
         idata = pm.sample(
@@ -1731,7 +1439,7 @@ def run_bayesian_model_gpu(
             tune=tune,
             chains=chains,
             cores=cores,
-            target_accept=0.90,
+            target_accept=0.9,
             nuts_sampler="numpyro",
             nuts_sampler_kwargs={"chain_method": "vectorized"},
         )
@@ -1743,22 +1451,63 @@ def run_bayesian_model_gpu(
         if group in idata.groups():
             del idata[group]
 
+    # restructure inference data for named predictors
+    beta_da = idata.posterior["beta"]
+    named_betas = {
+        name: beta_da.isel(beta_dim_0=i).drop_vars("beta_dim_0")
+        for i, name in enumerate(fixed_cols)
+    }
+    idata.posterior = idata.posterior.drop_vars("beta")
+    idata.posterior = xr.merge([idata.posterior, xr.Dataset(named_betas)])
+
+    # replace categorical codes with names
+    def map_hierarchical_vars(idata):
+        hierarchical_mappings = {
+            "region_mean": REGION_NAMES,
+            "region_raw": REGION_NAMES,
+            "size_mean": PRACTICE_SIZES,
+            "size_raw": PRACTICE_SIZES,
+        }
+        for var, names in hierarchical_mappings.items():
+            if var in idata.posterior:
+                da = idata.posterior[var]
+                new_vars = {}
+                for i, name in enumerate(names):
+                    new_name = f"{var}[{name}]"
+                    new_vars[new_name] = da.isel({da.dims[-1]: i}).drop_vars(da.dims[-1])
+                idata.posterior = idata.posterior.drop_vars(var)
+                idata.posterior = xr.merge([idata.posterior, xr.Dataset(new_vars)])
+        return idata
+    idata = map_hierarchical_vars(idata)
+
+    # compute and save lag effects
+    if lag > 0:
+        lag_effect_vars = {}
+        for var in continuous_vars:
+            basis_names = [
+                name for name in fixed_cols
+                if name.startswith(f"{var}_almon_basis_")
+            ]
+            if not basis_names:
+                continue
+            for l in range(lag + 1):
+                weights = almon_X[l, :len(basis_names)]
+                effect = sum(
+                    idata.posterior[name] * w
+                    for name, w in zip(basis_names, weights)
+                )
+                lag_effect_vars[f"{var}_lag_effect[{l}]"] = effect
+        if lag_effect_vars:
+            idata.posterior = xr.merge(
+                [idata.posterior, xr.Dataset(lag_effect_vars)]
+            )
+
     # save posterior summary with categorical names
     summary_df = az.summary(idata, hdi_prob=0.95)
-    for cat in categorical_vars:
-        categories = list(cat_code_maps[cat].categories)
-        if cat == "month":  # map numeric month categories to names for month
-            categories = [MONTHS[i - 1] if 1 <= i <= 12 else str(i) for i in categories]
-        # if cat == "flood":  # map flood categories to names
-        #     categories = ["1", "0"]
-        for i, name in enumerate(categories):
-            col_name = f"{cat}_effect[{i}]"
-            if col_name in summary_df.index:
-                summary_df = summary_df.rename(index={col_name: f"{cat}_effect[{name}]"})
-    summary_df['mean_pct'] = 100 * (np.exp(summary_df['mean']) - 1)
-    summary_df['hdi_2.5pc_pct'] = 100 * (np.exp(summary_df['hdi_2.5%']) - 1)
-    summary_df['hdi_97.5pc_pct'] = 100 * (np.exp(summary_df['hdi_97.5%']) - 1)
-    summary_df = summary_df.reset_index()
+    summary_df["mean_pct"] = 100 * (np.exp(summary_df["mean"]) - 1)
+    summary_df["hdi_2.5pc_pct"] = 100 * (np.exp(summary_df["hdi_2.5%"]) - 1)
+    summary_df["hdi_97.5pc_pct"] = 100 * (np.exp(summary_df["hdi_97.5%"]) - 1)
+    summary_df = summary_df.reset_index().rename(columns={"index": "parameter"})
     summary_csv = os.path.join(results_folder, "bayesian_model_summary.csv")
     summary_df.to_csv(summary_csv, index=False)
     status(f"Posterior summary saved to: {summary_csv}", level=1)
@@ -1992,8 +1741,36 @@ def generate_bayesian_diagnostics(idata, results_folder, max_subplots=40):
     auto_corr_folder = os.path.join(results_folder, "autocorr")
     os.makedirs(results_folder, exist_ok=True)
     os.makedirs(auto_corr_folder, exist_ok=True)
+
+    # combine intercept and slope RE if available
+    re_vars = []
+    if "intercept_re" in idata.posterior.data_vars:
+        re_vars.append("intercept_re")
+    if "slope_re" in idata.posterior.data_vars:
+        re_vars.append("slope_re")
+
+    # compute rhat for all random effects
+    if re_vars:
+        rhat_vals = az.rhat(idata, var_names=re_vars)
+        flattened = []
+        for var in re_vars:
+            shape = idata.posterior[var].shape  # (chains, draws, n_practice)
+            n_practice = shape[-1]
+            for idx in range(n_practice):
+                val = rhat_vals[var].values[..., idx].mean()  # take mean over chain/draws
+                flattened.append((var, idx, val))
+        worst_10 = sorted(flattened, key=lambda x: -x[2])[:10]
+        worst_var_names = [
+            f"{var}[practice_{idx},rank_{i+1}]" 
+            for i, (var, idx, _) in enumerate(worst_10)
+        ]
+
+    # select posterior variables including only 10 worst rhat random effects
     posterior_vars = [var for var in idata.posterior.data_vars
-                      if "intercept_re" not in var and "slope_re" not in var]
+                      if "intercept_re" not in var and
+                      "slope_re" not in var]
+    if re_vars:
+        posterior_vars += worst_var_names
 
     # convergence (trace) plots
     for i, start in enumerate(range(0, len(posterior_vars), max_subplots)):
@@ -2045,7 +1822,7 @@ def generate_bayesian_diagnostics(idata, results_folder, max_subplots=40):
 
     # posterior predictive checks
     if "posterior_predictive" in idata.groups():
-        fig = az.plot_ppc(idata, num_pp_samples=100)
+        fig = az.plot_ppc(idata, num_pp_samples=50)
         plt.tight_layout()
         plt.savefig(os.path.join(results_folder, "ppc.png"), bbox_inches='tight')
         plt.close(fig='all')
@@ -2179,25 +1956,33 @@ def compare_bayesian_models(results_root):
             status(f"Warning: results not found at {summary_path}, skipping...", level=1)
             continue
 
-        df = pd.read_csv(summary_path).rename(columns={'index': 'name'})
+        df = pd.read_csv(summary_path).rename(columns={"parameter": "name"})
 
         # exclude random effects
-        df = df[~df["name"].str.contains(r"intercept_re|slope_re|practice_re|\|", regex=True)]
+        exclude_pattern = (
+            r"^Intercept$|^sigma($|\_)|"
+            r"^sigma_|^region_|^size_|^practice_|"
+            r"_raw$|_offset$|"
+            r"^slope_re$|^slope_re_offset$"
+        )
+        df = df[~df["name"].str.contains(exclude_pattern, regex=True)]
 
         # identify lagged variables
-        lagged_rows = df[df["name"].str.contains(r"_lag_effects\[\d+\]")].copy()
+        lagged_rows = df[df["name"].str.contains(r"_lag_effect\[\d+\]")].copy()
         if not lagged_rows.empty:
-            lagged_rows["variable"] = lagged_rows["name"].str.replace(r"\[.*\]", "", regex=True)
-            lagged_rows["lag"] = lagged_rows["name"].str.extract(r"\[(\d+)\]").astype(int)
+            lagged_rows["variable"] = lagged_rows["name"].str.replace(
+                r"_lag_effect\[\d+\]", "", regex=True
+            )
+            lagged_rows["lag"] = (lagged_rows["name"].str.extract(r"\[(\d+)\]").astype(int))
             lagged_dataframes.append(lagged_rows)
             lagged_data_inds.append(i)
 
         # numeric predictors (exclude intercept, sigma, month, region)
-        numeric_rows = df[~df["name"].str.contains(r"Intercept|sigma|month|region|practice", regex=True)]
+        numeric_rows = df[~df["name"].str.contains(r"_lag_effect|^month\[|^region_|^size_",
+                                                   regex=True)]
         if not numeric_rows.empty:
             numeric_dataframes.append(numeric_rows)
-            if not numeric_rows.empty:
-                numeric_data_inds.append(i)
+            numeric_data_inds.append(i)
 
     if not numeric_dataframes and not lagged_dataframes:
         raise FileNotFoundError("No Bayesian results found — nothing to plot.")
@@ -2212,8 +1997,8 @@ def compare_bayesian_models(results_root):
             df_list = [extract_lag_values(df, lag) for df in lagged_dataframes]
             fig, ax = plot_combined(
                 df_list=df_list,
-                labels_list=[PRES_LABELS[i] for i in lagged_data_inds[:len(lagged_dataframes)]],
-                colours_list=[PRES_COLOURS[i] for i in lagged_data_inds[:len(lagged_dataframes)]],
+                labels_list=[PRES_LABELS[i] for i in lagged_data_inds],
+                colours_list=[PRES_COLOURS[i] for i in lagged_data_inds],
                 col_est="mean_pct",
                 col_low="hdi_2.5pc_pct",
                 col_high="hdi_97.5pc_pct",
@@ -2231,8 +2016,8 @@ def compare_bayesian_models(results_root):
             plot_lagged_variable(
                 var=var,
                 dataframes=lagged_dataframes,
-                labels=[PRES_LABELS[i] for i in lagged_data_inds[:len(lagged_dataframes)]],
-                colours=[PRES_COLOURS[i] for i in lagged_data_inds[:len(lagged_dataframes)]],
+                labels=[PRES_LABELS[i] for i in lagged_data_inds],
+                colours=[PRES_COLOURS[i] for i in lagged_data_inds],
                 outpath=os.path.join(lag_plot_folder, f"{var}.png"),
                 col_est="mean_pct",
                 col_low="hdi_2.5pc_pct",
@@ -2245,8 +2030,8 @@ def compare_bayesian_models(results_root):
         status("Generating combined predictor plot...", level=1)
         fig, ax = plot_combined(
             df_list=numeric_dataframes,
-            labels_list=[PRES_LABELS[i] for i in numeric_data_inds[:len(numeric_dataframes)]],
-            colours_list=[PRES_COLOURS[i] for i in numeric_data_inds[:len(numeric_dataframes)]],
+            labels_list=[PRES_LABELS[i] for i in numeric_data_inds],
+            colours_list=[PRES_COLOURS[i] for i in numeric_data_inds],
             col_est="mean_pct",
             col_low="hdi_2.5pc_pct",
             col_high="hdi_97.5pc_pct",
@@ -2271,8 +2056,8 @@ def compare_bayesian_models(results_root):
             plot_variable(
                 var=var,
                 dataframes=numeric_dataframes,
-                labels=[PRES_LABELS[i] for i in numeric_data_inds[:len(numeric_dataframes)]],
-                colours=[PRES_COLOURS[i] for i in numeric_data_inds[:len(numeric_dataframes)]],
+                labels=[PRES_LABELS[i] for i in numeric_data_inds],
+                colours=[PRES_COLOURS[i] for i in numeric_data_inds],
                 var_extractor=bayes_extractor,
                 outpath=os.path.join(plot_folder, f"{var}.png"),
                 col_est="mean_pct",
@@ -2283,11 +2068,11 @@ def compare_bayesian_models(results_root):
 
     # regional effects
     status("Generating regional effects plot...", level=1)
-    plot_regions(results_folders, plot_root)
+    plot_regions_bayes(results_folders, plot_root)
 
     # seasonal effects
     status("Generating month effects plot...", level=1)
-    plot_months(results_folders, plot_root)
+    plot_months_bayes(results_folders, plot_root)
 
 # ANALYSIS HELPERS --------------------------------------------------------------------------------
 def plot_combined(
@@ -2493,146 +2278,155 @@ def plot_prior_distributions(ds):
         plt.savefig(f"outputs/prior_test/{var}.png")
         plt.close()
 
-def plot_regions(results_folders, plot_root):
+def plot_regions_bayes(results_folders, plot_root):
     """
     Plots regional effects across prescription types from Bayesian model summaries.
-    Only non-reference regions are plotted, with effects relative to the reference region.
+    Effects are deviations from the national mean (centred hierarchical intercepts).
     """
-
-    region_dfs, data_inds = [], []
-
+    region_dfs = []
+    labels = []
+    colours = []
     for i, folder in enumerate(results_folders):
+        # load csv data
         summary_path = os.path.join(folder, "bayesian_model_summary.csv")
         if not os.path.exists(summary_path):
             continue
-        df = pd.read_csv(summary_path).rename(columns={'index': 'name'})
-
-        # identify reference region: the one NOT in C(region)[*] or region_effect[*]
-        all_regions = [r.replace("C(region, Treatment(reference=\"South East\"))[", "").replace("]", "")
-                       for r in df["name"] if r.startswith("C(region")]
-        if not all_regions:
-            all_regions = [r.replace("region_effect[", "").replace("]", "")
-                           for r in df["name"] if r.startswith("region_effect")]
-        try:
-            ref_region = next(r for r in REGION_NAMES if r not in all_regions)
-        except StopIteration:
-            raise ValueError("Could not determine reference region from model summary.")
+        df = pd.read_csv(summary_path).rename(columns={"parameter": "name"})
 
         # extract relative regional effects
-        region_rows = df[df["name"].str.startswith("C(region") | df["name"].str.startswith("region_effect")]
+        region_rows = df[df["name"].str.startswith("region_mean")]
+        if region_rows.empty:
+            continue
         region_data = []
         for _, row in region_rows.iterrows():
             region_name = row["name"].split("[")[1].replace("]", "")
             region_data.append({
                 "name": region_name,
-                "coef": row["mean"],
-                "ci_low": row["hdi_2.5%"],
-                "ci_high": row["hdi_97.5%"],
-                "pres_code": PRES_CODES[i]
+                "coef": row["mean_pct"],
+                "ci_low": row["hdi_2.5pc_pct"],
+                "ci_high": row["hdi_97.5pc_pct"],
             })
 
         # add to dataframe list
         region_dfs.append(pd.DataFrame(region_data))
-        data_inds.append(i)
+        labels.append(PRES_LABELS[i])
+        colours.append(PRES_COLOURS[i])
 
-    if not region_dfs or len(region_dfs) == 0:
+    if not region_dfs:
         status("No regional data found.", level=1)
         return
 
-    # prepare list of dataframes per prescription code and plot
-    region_df_list = [df[df["pres_code"] == code]
-                      for df in region_dfs for code in PRES_CODES]
+    # plot combined regional effects
     fig_region, ax_region = plot_combined(
-        region_df_list,
-        labels_list=PRES_LABELS,
-        colours_list=PRES_COLOURS,
-        x_label=f"Effect relative to {ref_region} region (%)",
+        region_dfs,
+        labels_list=labels,
+        colours_list=colours,
+        x_label="Deviation from national mean (%)",
         region_plot=True,
         order=REGION_NAMES,
         col_est="coef",
         col_low="ci_low",
-        col_high="ci_high"
+        col_high="ci_high",
     )
+
+    # finalise plot
     fig_region.tight_layout()
-    add_legend(fig_region, ax_region, labels=PRES_LABELS, legend_y_offset_px=42)
+    add_legend(fig_region, ax_region, labels=labels, legend_y_offset_px=42)
     os.makedirs(plot_root, exist_ok=True)
-    fig_region.savefig(os.path.join(plot_root, "compare_regions.png"), dpi=600, bbox_inches='tight')
+    fig_region.savefig(
+        os.path.join(plot_root, "compare_regions.png"),
+        dpi=600,
+        bbox_inches="tight",
+    )
     plt.close(fig_region)
     status(f"Bayesian regional effects plot saved to {plot_root}compare_regions.png", level=1)
 
-def plot_months(results_folders, plot_root):
+def plot_months_bayes(results_folders, plot_root):
     """
     Plots month effects across prescription types from Bayesian model summaries.
-    Only non-reference months are plotted (effects are relative to the reference month).
+    Month coefficients are named month[1] ... month[12], with one omitted
+    reference month. Effects are relative to that missing month.
     """
-
-    month_dfs, data_inds = [], []
-
+    month_dfs = []
+    labels = []
+    colours = []
+    ref_month_idx = None
     for i, folder in enumerate(results_folders):
+        # load csv data
         summary_path = os.path.join(folder, "bayesian_model_summary.csv")
         if not os.path.exists(summary_path):
             continue
+        df = pd.read_csv(summary_path).rename(columns={"parameter": "name"})
 
-        df = pd.read_csv(summary_path).rename(columns={'index': 'name'})
+        # extract month coefficients
+        month_rows = df[df["name"].str.match(r"^month\[\d+\]$")].copy()
+        if month_rows.empty:
+            continue
+        month_rows["month_idx"] = (
+            month_rows["name"]
+            .str.extract(r"\[(\d+)\]")
+            .astype(int)
+        )
 
-        # extract all months present in model output
-        all_months = []
-        for name in df["name"]:
-            if name.startswith("month_effect["):
-                m = name.split("[")[1].replace("]", "")
-                all_months.append(m)
+        # detect reference month (the missing one)
+        present = set(month_rows["month_idx"])
+        missing = sorted(set(range(1, 13)) - present)
+        if len(missing) != 1:
+            raise ValueError(
+                f"Could not uniquely determine reference month in {folder}: {missing}"
+            )
 
-        # determine reference month = the one not in all_months
-        try:
-            ref_month = next(m for m in MONTHS if m not in all_months)
-        except StopIteration:
-            raise ValueError("Could not determine reference month from model summary.")
+        # enforce consistency across prescriptions
+        if ref_month_idx is None:
+            ref_month_idx = missing[0]
+        elif ref_month_idx != missing[0]:
+            raise ValueError(
+                "Reference month differs across prescriptions - models are not comparable."
+            )
 
-        # extract month effects
-        month_rows = df[df["name"].str.startswith("month_effect[")]
+        # build plotting dataframe
+        month_rows["name"] = month_rows["month_idx"].apply(
+            lambda m: MONTHS[m - 1]
+        )
+        month_rows = month_rows.rename(
+            columns={
+                "mean_pct": "coef",
+                "hdi_2.5pc_pct": "ci_low",
+                "hdi_97.5pc_pct": "ci_high",
+            }
+        )
 
-        month_data = []
-        for _, row in month_rows.iterrows():
-            month_name = row["name"].split("[")[1].replace("]", "")
-            month_data.append({
-                "name": month_name,
-                "coef": row["mean"],
-                "ci_low": row["hdi_2.5%"],
-                "ci_high": row["hdi_97.5%"],
-                "pres_code": PRES_CODES[i]
-            })
-
-        month_dfs.append(pd.DataFrame(month_data))
-        data_inds.append(i)
+        # add to list
+        month_dfs.append(
+            month_rows[["name", "coef", "ci_low", "ci_high"]]
+        )
+        labels.append(PRES_LABELS[i])
+        colours.append(PRES_COLOURS[i])
 
     if not month_dfs:
         status("No month data found.", level=1)
         return
+    ref_month_name = MONTHS[ref_month_idx - 1]
 
-    # rearrange into list format for plot_combined
-    month_df_list = [df[df["pres_code"] == code]
-                     for df in month_dfs for code in PRES_CODES]
-
-    fig_month, ax_month = plot_combined(
-        month_df_list,
-        labels_list=PRES_LABELS,
-        colours_list=PRES_COLOURS,
-        x_label=f"Effect relative to {ref_month} (%)",
-        region_plot=False,
+    # plot combined month effects
+    fig, ax = plot_combined(
+        df_list=month_dfs,
+        labels_list=labels,
+        colours_list=colours,
+        x_label=f"Effect relative to {ref_month_name} (%)",
         order=MONTHS,
         col_est="coef",
         col_low="ci_low",
-        col_high="ci_high"
+        col_high="ci_high",
     )
 
-    fig_month.tight_layout()
-    add_legend(fig_month, ax_month, labels=PRES_LABELS, legend_y_offset_px=42)
+    # finalise plot
+    fig.tight_layout()
+    add_legend(fig, ax, labels=labels, legend_y_offset_px=42)
     os.makedirs(plot_root, exist_ok=True)
-
     outpath = os.path.join(plot_root, "compare_months.png")
-    fig_month.savefig(outpath, dpi=600, bbox_inches='tight')
-    plt.close(fig_month)
-
+    fig.savefig(outpath, dpi=600, bbox_inches="tight")
+    plt.close(fig)
     status(f"Bayesian month effects plot saved to {outpath}", level=1)
 
 def fitted_scatter_plot(x, y, x_label, y_label, title, save_path):
