@@ -3,68 +3,52 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import matplotlib.pyplot as plt
-from funcs import run_bayesian_model, compare_bayesian_models
+from tqdm import tqdm
+from funcs import prepare_ds
 
-PRES_CODES = ['02_03_0501', '02', '03', '0501']
-PRES_LABELS = ['All', 'Cardiovascular', 'Respiratory', 'Antibiotics']
-PRES_COLOURS = ['black', 'red', 'blue', 'orange']
-# ordered north->south, east->west with "South East" last (reference category)
-REGION_NAMES = ["North East", "North West", "Yorkshire and The Humber",
-                "East Midlands", "West Midlands", "East of England",
-                "London", "South West", "South East"]
-PRACTICE_SIZES = ["small", "large"]
-# ordered months with "September" last (reference category)
-MONTHS = ["January", "February", "March", "April", "May", "June",
-          "July", "August", "September", "October", "November", "December"]
+# load data
+data = xr.load_dataset("./data/prescriptions_02_03_0501_2010-08_2025-08_with_flags.nc")
 
-# setup toy dataset
-np.random.seed(42)
-n_practices = 5
-n_months = 12
-n_obs = n_practices * n_months
-practice_ids = [f"P{i+1}" for i in range(n_practices)]
-date = pd.date_range(start="2020-01-01", periods=n_months, freq="M")
-months = np.tile(np.arange(1, n_months + 1), n_practices)
-date_codes = np.tile(np.arange(n_months), n_practices)
-regions = np.random.choice(REGION_NAMES, n_practices)
-sizes = np.random.choice(PRACTICE_SIZES, n_practices)
-region_map = dict(zip(practice_ids, regions))
-size_map = dict(zip(practice_ids, sizes))
-X1 = np.random.normal(0, 1, n_obs)
-X2 = np.random.normal(5, 2, n_obs)
-items = np.exp(1 + 0.3*X1 - 0.2*X2 + np.random.normal(0, 0.2, n_obs)).astype(int)
-df = pd.DataFrame({
-    "practice_id": np.repeat(practice_ids, n_months),
-    "date": np.tile(date, n_practices),
-    "date_code": date_codes,
-    "month": months,
-    "region": [region_map[p] for p in np.repeat(practice_ids, n_months)],
-    "practice_size": [size_map[p] for p in np.repeat(practice_ids, n_months)],
-    "items": items,
-    "X1": X1,
-    "X2": X2
-})
-ds = df.set_index(["practice_id", "date"]).to_xarray()
-results_folder = "temp/02/"
-os.makedirs(results_folder, exist_ok=True)
+standardise_items = False
+clean_items = True
+adjust_predictors = 'z-global'
+deseasonalise_predictors = False
+practice_mean_thresh = 500
 
-# run model
-model, idata = run_bayesian_model(
-    ds=ds,
-    raw_vars=["X1", "X2"],
-    results_folder=results_folder,
-    lag=1,
-    almon_order=2,
-    individual_priors=True,
-    deseasonalise_output=True,
-    practice_correction=1,
-    min_practice_obs=3,
-    likelihood="normal",
-    draws=100,
-    tune=100,
-    chains=1,
-    cores=1
+data = prepare_ds(
+    data,
+    standardise_items=standardise_items,
+    clean_items=clean_items,
+    adjust_predictors=adjust_predictors,
+    deseasonalise_predictors=deseasonalise_predictors,
+    practice_mean_thresh=practice_mean_thresh
 )
 
-# plot
-compare_bayesian_models("/".join(results_folder.split("/")[:-2]) + "/")
+data['items'] = xr.where(data['items'] <= 0, np.nan, data['items'])
+
+# drop all dates where any variable is NaN, per practice
+def clean_practice(ds, practice_id):
+    practice_data = ds.sel(practice_id=practice_id)
+    # drop dates where any variable is NaN
+    practice_data = practice_data.dropna(dim='date', how='any')
+    return practice_data
+
+cleaned_practices = []
+for pid in tqdm(data['practice_id'].values):
+    cleaned_practices.append(clean_practice(data, pid))
+
+# combine back into single dataset
+data_cleaned = xr.concat(cleaned_practices, dim='practice_id')
+data_cleaned['practice_id'] = data['practice_id']  # restore practice_ids
+
+# number of observations per practice
+obs_per_practice = data_cleaned['items'].notnull().sum(dim='date')
+
+# plot histogram
+plt.figure(figsize=(8, 5))
+plt.hist(obs_per_practice.values, bins=30, edgecolor='black')
+plt.xlabel('Number of observations per practice')
+plt.ylabel('Number of practices')
+plt.title('Histogram of observations per practice after cleaning')
+plt.savefig('testing.png', bbox_inches='tight')
+plt.show()

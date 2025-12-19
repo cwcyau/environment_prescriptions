@@ -60,7 +60,14 @@ parser.add_argument("--cores", type=int, default=8,
                     help="Number of CPU cores to use (default: 8).")
 parser.add_argument("--n_practices", type=int, default=None,
                     help="Limit to n randomly selected practices (None for all practices).")
+parser.add_argument("--use_gpu", action="store_true",
+                    help="Use GPU acceleration if available.")
+parser.add_argument('--no_gpu', dest='use_gpu', action='store_false')
+parser.set_defaults(use_gpu=False)
+parser.add_argument('--practice_correction', type=int, default=1,
+                    help="Practice correction level: 0 = none, 1 = intercept only, 2 = intercept + slope, 3 = intercept + slope + correlation (default: 1).")
 args = parser.parse_args()
+use_gpu = args.use_gpu
 lag = args.lag
 prescription_code = args.prescription_code
 tune = args.tune
@@ -70,6 +77,7 @@ if n_practices == 0:
     n_practices = None
 chains = args.chains
 cores = args.cores
+practice_correction = args.practice_correction
 
 # data preparation parameters
 # n_practices = None  # limit to n randomly selected practices (None for all practices)
@@ -82,9 +90,9 @@ practice_mean_thresh = 500  # threshold for defining large vs small practices
 # modelling parameters
 min_obs_per_practice = 20  # practices with fewer points will be excluded (after all rows in final df with nans have been removed)
 almon_order = 1  # order of almon lag polynomial (only used if lag > 0)
-practice_correction = 2  # 0 = none, 1 = intercept only, 2 = intercept + slope, 3 = intercept + slope + correlation (keep as 2 as runs within walltime)
+# practice_correction = 1  # 0 = none, 1 = intercept only, 2 = intercept + slope, 3 = intercept + slope + correlation (keep as 2 as runs within walltime)
 deseasonalise_output = True  # whether to include a seasonal correction term for output variable (items) (always True as adding seasonal term is inexpensive)
-likelihood = "studentt"  # likelihood to use: "normal" or "studentt"
+likelihood = "normal"  # likelihood to use: "normal" or "studentt"
 # draws = 2000  # number of MCMC draws
 # tune = 2000  # number of tuning steps
 # chains = 8  # number of MCMC chains
@@ -184,8 +192,11 @@ if __name__ == "__main__":
 
     # run the bayesian models
     status("Initialising model run...")
-    jax.config.update("jax_platform_name", "gpu")
-    status(f"Using device: {jax.devices()[0]}", level=1)
+    if use_gpu:
+        jax.config.update("jax_platform_name", "gpu")
+        status(f"Using device: {jax.devices()[0]}", level=1)
+    else:
+        status("Using device: CPU", level=1)
     run_bayesian_model(
         ds,
         raw_vars=predictors,
@@ -196,6 +207,7 @@ if __name__ == "__main__":
         practice_correction=practice_correction,
         min_practice_obs=min_obs_per_practice,
         likelihood=likelihood,
+        use_gpu=use_gpu,
         draws=draws,
         tune=tune,
         chains=chains,
