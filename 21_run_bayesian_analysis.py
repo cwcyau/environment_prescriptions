@@ -149,6 +149,14 @@ predictors = [  # reduced set
     "aqrean_sulfur_dioxide_values",
     # "aqrean_daqi_sulfur_dioxide_values"
 ]
+# vars to exclude from lagging
+no_lag_vars = [
+    "imd_centile_values",
+]
+# vars to use practice level means instead of time series
+no_time_vars = [
+    "imd_centile_values",
+]
 # =================================================================================================
 
 if __name__ == "__main__":
@@ -178,6 +186,8 @@ if __name__ == "__main__":
     status(f"practice_mean_thresh: {practice_mean_thresh}", level=2)
     status("Predictor variables:", level=1)
     [status(f"{predictor}", level=2) for predictor in predictors]
+    status("Non-lagged variables:", level=1)
+    [status(f"{predictor}", level=2) for predictor in no_lag_vars]
 
     # collect and prepare the dataset
     status(f"Preparing dataset...")
@@ -201,6 +211,8 @@ if __name__ == "__main__":
         ds,
         raw_vars=predictors,
         results_folder=results_folder,
+        no_lag_vars=no_lag_vars,
+        no_time_vars=no_time_vars,
         lag=lag,
         almon_order=almon_order,
         deseasonalise_output=deseasonalise_output,

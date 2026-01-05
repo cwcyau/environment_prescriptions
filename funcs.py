@@ -1154,12 +1154,15 @@ def run_bayesian_model(
     ds,
     raw_vars: list,
     results_folder: str,
+    no_lag_vars: list = [],
+    no_time_vars: list = [],
     lag: int = 0,
     almon_order: int = 2,
     individual_priors: bool = True,
     deseasonalise_output: bool = True,
     practice_correction: int = 1,
     min_practice_obs: int = 20,
+    min_obs_for_slope: int = 50,
     likelihood: str = "normal",
     use_gpu: bool = False,
     draws: int = 2000,
@@ -1176,6 +1179,10 @@ def run_bayesian_model(
         Dataset containing monthly 'items', date_code, practice covariates and the predictor variables.
     raw_vars : list
         List of predictor variable names (strings) in ds to include in the model.
+    no_lag_vars : list
+        List of predictor variable names (strings) in ds to include without lagging.
+    no_time_vars : list
+        List of predictor variable names (strings) in ds to use practice-level mean instead of time-varying effects.
     results_folder : str
         Directory where CSV and traceplot outputs will be saved.
     lag : int
@@ -1225,14 +1232,30 @@ def run_bayesian_model(
         raise ValueError("no practices with sufficient observations after filtering")
     status(f"Using {len(valid_practices)} practices with >= {min_practice_obs} observations",
            level=1)
+    
+    if no_time_vars:
+        status(f"Collapsing no-time variables to practice means: {no_time_vars}", level=1)
+        practice_means = (
+            df.groupby("practice_id")[no_time_vars]
+            .mean()
+            .reset_index()
+        )
+        df = df.drop(columns=no_time_vars)
+        df = df.merge(practice_means, on="practice_id", how="left")
 
     # generate lagged variables if lag > 0
+    lag_vars = [v for v in raw_vars
+                if v not in no_lag_vars
+                and v not in no_time_vars]
     if lag > 0:
         status(f"Creating lagged variables up to lag {lag}...", level=1)
-        for var in raw_vars:
+        overlap = set(raw_vars) & set(no_lag_vars)
+        if overlap:
+            status(f"Treating these variables as non-lagged: {sorted(overlap)}", level=1)
+        for var in lag_vars:
             for l in range(lag+1):
                 df[f"{var}_lag{l}"] = df.groupby("practice_id")[var].shift(l)
-        df = df.dropna(subset=[f"{v}_lag{l}" for v in raw_vars for l in range(lag+1)])
+        df = df.dropna(subset=[f"{v}_lag{l}" for v in lag_vars for l in range(lag+1)])
 
         # create Almon bases
         status(f"Creating almon lag basis of order {almon_order}...", level=1)
@@ -1244,7 +1267,7 @@ def run_bayesian_model(
         almon_X = almon_weights(lag_basis, almon_order)
 
         # create Almon-basis columns for each variable
-        for var in raw_vars:
+        for var in lag_vars:
             lagged_vals = df[[f"{var}_lag{l}" for l in range(lag+1)]].values
             M = lagged_vals @ almon_X
             for j in range(M.shape[1]):
@@ -1252,7 +1275,6 @@ def run_bayesian_model(
                 df[colname] = M[:, j]
 
     # identify continuous and categorical predictors
-    continuous_vars = raw_vars.copy()
     categorical_vars = []
     if deseasonalise_output:
         categorical_vars.append("month")
@@ -1285,13 +1307,12 @@ def run_bayesian_model(
 
     # continuous predictors
     if lag == 0:
-        for var in continuous_vars:
+        for var in raw_vars:
             if var in df.columns:
                 fixed_cols.append(var)
                 X_fixed_list.append(df[var].values.astype("float32").reshape(-1, 1))
     elif lag > 0:
-        M_all_list = []
-        for var in continuous_vars:
+        for var in lag_vars:
             basis_cols = [
                 c for c in df.columns
                 if c.startswith(f"{var}_almon_basis_")
@@ -1300,9 +1321,11 @@ def run_bayesian_model(
                 continue
             M_var = df[basis_cols].values.astype("float32")
             fixed_cols.extend(basis_cols)
-            M_all_list.append(M_var)
-        if M_all_list:
-            X_fixed_list.append(np.concatenate(M_all_list, axis=1).astype("float32"))
+            X_fixed_list.append(M_var)
+        for var in no_lag_vars:
+            if var in df.columns:
+                fixed_cols.append(var)
+                X_fixed_list.append(df[var].values.astype("float32").reshape(-1, 1))
 
     # categorical predictors
     cat_col_slices = {}
@@ -1340,7 +1363,17 @@ def run_bayesian_model(
         (np.ones(n_obs, dtype="float32"), (np.arange(n_obs), practice_idx)),
         shape=(n_obs, n_practice)
     ).astype("float32")
-    Z_practice_slope = Z_practice.multiply(date_code[:, None]).tocsr().astype("float32")
+    # slope RE only for practices with sufficient observations
+    sufficient_obs = df.groupby("practice_id").size() > min_obs_for_slope
+    slope_practices = sufficient_obs[sufficient_obs].index  # only these get slope RE
+    slope_rows = df["practice_id"].isin(slope_practices)
+    Z_practice_slope = sp.csr_matrix(
+        (np.ones(slope_rows.sum(), dtype="float32"),
+        (np.where(slope_rows)[0],
+        pd.Categorical(df.loc[slope_rows, "practice_id"], categories=slope_practices).codes)),
+        shape=(len(df), len(slope_practices))
+    )
+    Z_practice_slope = Z_practice_slope.multiply(date_code[:, None]).tocsr().astype("float32")
     # use dense matrices for region and size random effects (few levels)
     Z_region_data = np.eye(n_region, dtype="float32")[region_idx]
     Z_size_data   = np.eye(n_size,   dtype="float32")[size_idx]
@@ -1404,7 +1437,7 @@ def run_bayesian_model(
             # slope (only for practice_correction == 2)
             if practice_correction == 2:
                 sigma_slope = pm.HalfNormal("sigma_slope", practice_slopes_std)
-                slope_re_offset = pm.Normal("slope_re_offset", 0.0, 1.0, shape=n_practice)
+                slope_re_offset = pm.Normal("slope_re_offset", 0.0, 1.0, shape=len(slope_practices))
                 slope_re = pm.Deterministic("slope_re", slope_re_offset * sigma_slope)
                 practice_slope_term = pm.math.dot(Z_practice_slope_data,
                                                   slope_re[:, None]).squeeze()
@@ -1499,7 +1532,7 @@ def run_bayesian_model(
     # compute and save lag effects
     if lag > 0:
         lag_effect_vars = {}
-        for var in continuous_vars:
+        for var in lag_vars:
             basis_names = [
                 name for name in fixed_cols
                 if name.startswith(f"{var}_almon_basis_")
