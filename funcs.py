@@ -1157,8 +1157,7 @@ def run_bayesian_model(
     no_lag_vars: list = [],
     no_time_vars: list = [],
     lag: int = 0,
-    almon_order: int = 2,
-    individual_priors: bool = True,
+    almon_order: int = 1,
     deseasonalise_output: bool = True,
     practice_correction: int = 1,
     min_practice_obs: int = 20,
@@ -1179,12 +1178,12 @@ def run_bayesian_model(
         Dataset containing monthly 'items', date_code, practice covariates and the predictor variables.
     raw_vars : list
         List of predictor variable names (strings) in ds to include in the model.
+    results_folder : str
+        Directory where CSV and traceplot outputs will be saved.
     no_lag_vars : list
         List of predictor variable names (strings) in ds to include without lagging.
     no_time_vars : list
         List of predictor variable names (strings) in ds to use practice-level mean instead of time-varying effects.
-    results_folder : str
-        Directory where CSV and traceplot outputs will be saved.
     lag : int
         Number of lagged months to include for each predictor variable.
     almon_order : int
@@ -1274,31 +1273,31 @@ def run_bayesian_model(
                 colname = f"{var}_almon_basis_{j}"
                 df[colname] = M[:, j]
 
-    # identify continuous and categorical predictors
-    categorical_vars = []
-    if deseasonalise_output:
-        categorical_vars.append("month")
+    # # identify continuous and categorical predictors
+    # categorical_vars = []
+    # if deseasonalise_output:
+    #     categorical_vars.append("month")
 
-    # map categorical codes for CSV later
-    cat_code_maps = {}
-    for cat in categorical_vars:
-        # reference category at end of categories list
-        if cat == "month":
-            ref = "September"
-            num_ref = MONTHS.index(ref) + 1
-            categories = [m for m in range(1, 13) if m != num_ref] + [num_ref]
-            cat_code_maps[cat] = pd.Categorical(df[cat], categories=categories)
-        else:
-            cat_code_maps[cat] = pd.Categorical(df[cat])
+    # # map categorical codes for CSV later
+    # cat_code_maps = {}
+    # for cat in categorical_vars:
+    #     # reference category at end of categories list
+    #     if cat == "month":
+    #         ref = "September"
+    #         num_ref = MONTHS.index(ref) + 1
+    #         categories = [m for m in range(1, 13) if m != num_ref] + [num_ref]
+    #         cat_code_maps[cat] = pd.Categorical(df[cat], categories=categories)
+    #     else:
+    #         cat_code_maps[cat] = pd.Categorical(df[cat])
 
-    # warn for missing categories
-    for cat, cat_obj in cat_code_maps.items():
-        present = set(df[cat].unique())
-        expected = list(cat_obj.categories)
-        missing = [c for c in expected if c not in present]
-        if missing:
-            status(f"Warning: for categorical {cat}, these levels were NOT present in data: {missing}",
-                   level=1)
+    # # warn for missing categories
+    # for cat, cat_obj in cat_code_maps.items():
+    #     present = set(df[cat].unique())
+    #     expected = list(cat_obj.categories)
+    #     missing = [c for c in expected if c not in present]
+    #     if missing:
+    #         status(f"Warning: for categorical {cat}, these levels were NOT present in data: {missing}",
+    #                level=1)
 
     # precompute and combine design matrics =======================================================
     status("Building combined design matrices and gathering statistics...", level=1)
@@ -1327,21 +1326,21 @@ def run_bayesian_model(
                 fixed_cols.append(var)
                 X_fixed_list.append(df[var].values.astype("float32").reshape(-1, 1))
 
-    # categorical predictors
-    cat_col_slices = {}
-    for cat in categorical_vars:
-        cat_obj = pd.Categorical(df[cat], categories=cat_code_maps[cat].categories)
-        levels = list(cat_obj.categories)
-        cat_codes = pd.get_dummies(cat_obj, prefix=cat, drop_first=False)
-        ref_level = levels[-1]
-        ref_col = f"{cat}_{ref_level}"
-        # keep only non-reference columns
-        nonref_cols = [c for c in cat_codes.columns if c != ref_col]
-        nonref_levels = [lvl for lvl in levels if lvl != ref_level]
-        cat_codes_nonref = cat_codes[nonref_cols]
-        fixed_cols.extend([f"{cat}[{lvl}]" for lvl in nonref_levels])
-        X_fixed_list.append(cat_codes_nonref.values.astype("float32"))
-        cat_col_slices[cat] = (len(fixed_cols) - cat_codes_nonref.shape[1], len(fixed_cols))
+    # # categorical predictors
+    # cat_col_slices = {}
+    # for cat in categorical_vars:
+    #     cat_obj = pd.Categorical(df[cat], categories=cat_code_maps[cat].categories)
+    #     levels = list(cat_obj.categories)
+    #     cat_codes = pd.get_dummies(cat_obj, prefix=cat, drop_first=False)
+    #     ref_level = levels[-1]
+    #     ref_col = f"{cat}_{ref_level}"
+    #     # keep only non-reference columns
+    #     nonref_cols = [c for c in cat_codes.columns if c != ref_col]
+    #     nonref_levels = [lvl for lvl in levels if lvl != ref_level]
+    #     cat_codes_nonref = cat_codes[nonref_cols]
+    #     fixed_cols.extend([f"{cat}[{lvl}]" for lvl in nonref_levels])
+    #     X_fixed_list.append(cat_codes_nonref.values.astype("float32"))
+    #     cat_col_slices[cat] = (len(fixed_cols) - cat_codes_nonref.shape[1], len(fixed_cols))
 
     # prepare data arrays
     X_fixed = np.concatenate(X_fixed_list, axis=1).astype("float32")
@@ -1349,6 +1348,16 @@ def run_bayesian_model(
     practice_idx = pd.Categorical(df["practice_id"]).codes.astype("int32")
     n_practice = int(df["practice_id"].nunique())
     date_code = df["date_code"].values.astype("float32")
+    month_idx = (df["month"].values - 1).astype("int32")  # 0–11
+
+    # ensure all x_fixed vars are standardised
+    X_means = X_fixed.mean(axis=0)
+    X_stds = X_fixed.std(axis=0)
+    X_stds[X_stds == 0] = 1.0
+    flood_idx = [i for i, name in enumerate(fixed_cols)
+                 if name == "flood" or name.startswith("flood_lag")]
+    X_stds[flood_idx] = 1.0  # do not scale flood variable (or lags) as binary fields
+    X_fixed = (X_fixed - X_means) / X_stds
 
     # prepare practice covariates
     region_idx = pd.Categorical(df["region"], categories=REGION_NAMES).codes
@@ -1378,18 +1387,10 @@ def run_bayesian_model(
     Z_region_data = np.eye(n_region, dtype="float32")[region_idx]
     Z_size_data   = np.eye(n_size,   dtype="float32")[size_idx]
 
-    # standard deviations for priors
-    items_mean = df["items_log"].mean()
-    items_std = df["items_log"].std()
-    practice_intercepts_std = df.groupby("practice_id")["items_log"].mean().std()
-    practice_slopes_std = df.groupby("practice_id", sort=False).apply(
-        lambda d: np.polyfit(d["date_code"].values, d["items_log"].values, 1)[0],
-        include_groups=False
-    ).std()
-    region_means_std = df.groupby("region")["items_log"].mean().std()
-    size_means_std = df.groupby("practice_size")["items_log"].mean().std()
-    col_scales = X_fixed.std(axis=0)
-    beta_sigma = np.maximum(0.5, col_scales).astype("float32")
+    # categorise fixed effect columns
+    env_idx   = [i for i, n in enumerate(fixed_cols) if classify_beta(n) == "environmental"]
+    flood_idx = [i for i, n in enumerate(fixed_cols) if classify_beta(n) == "flood"]
+    # month_idx = [i for i, n in enumerate(fixed_cols) if classify_beta(n) == "month"]
 
     # create and run the model ====================================================================
     status("Running model...", level=1)
@@ -1399,11 +1400,21 @@ def run_bayesian_model(
         y_obs_data = pm.Data("y_obs", y_obs)
         Z_practice_data = pts.as_sparse_variable(Z_practice)
         Z_practice_slope_data = pts.as_sparse_variable(Z_practice_slope)
-        Z_region_data   = pm.Data("Z_region", Z_region_data)
-        Z_size_data     = pm.Data("Z_size", Z_size_data)
+        Z_region_data = pm.Data("Z_region", Z_region_data)
+        Z_size_data = pm.Data("Z_size", Z_size_data)
+        size_idx_data = pm.Data("size_idx", size_idx)
+        month_idx_data = pm.Data("month_idx", month_idx)
 
-        # global intercept
-        intercept = pm.Normal("Intercept", mu=items_mean, sigma=items_std)
+        # practice-size-specific intercepts
+        mu_alpha = pm.Normal("mu_alpha", 6.0, 2.0)  # mid-point between small and large practices in log-space
+        sigma_alpha = pm.HalfNormal("sigma_alpha", 2.0)  # intercept variability between practice sizes in log-space
+        alpha_size = pm.Normal(
+            "alpha_size",
+            mu=mu_alpha,
+            sigma=sigma_alpha,
+            shape=n_size
+        )
+        size_intercept = alpha_size[size_idx_data]
 
         # random effects
         if practice_correction == 0:
@@ -1411,19 +1422,13 @@ def run_bayesian_model(
             practice_slope_term = 0.0
         else:
             # region-level intercepts
-            sigma_region = pm.HalfNormal("sigma_region", region_means_std)
+            sigma_region = pm.HalfNormal("sigma_region", 0.5)
             region_raw = pm.Normal("region_raw", 0.0, 1.0, shape=n_region)
             region_mean = pm.Deterministic(
                 "region_mean", (region_raw - region_raw.mean()) * sigma_region
             )
-            # size-level intercepts
-            sigma_size = pm.HalfNormal("sigma_size", size_means_std)
-            size_raw = pm.Normal("size_raw", 0.0, 1.0, shape=n_size)
-            size_mean = pm.Deterministic(
-                "size_mean", (size_raw - size_raw.mean()) * sigma_size
-            )
             # practice-level deviations (non-centred)
-            sigma_practice = pm.HalfNormal("sigma_practice", practice_intercepts_std)
+            sigma_practice = pm.HalfNormal("sigma_practice", 1.0)
             practice_offset = pm.Normal("practice_offset", 0.0, 1.0, shape=n_practice)
             # intercept
             practice_intercept = (
@@ -1431,28 +1436,55 @@ def run_bayesian_model(
                     Z_practice_data,
                     (practice_offset * sigma_practice)[:, None]
                 ).squeeze() +
-                pm.math.dot(Z_region_data, region_mean) +
-                pm.math.dot(Z_size_data, size_mean)
+                pm.math.dot(Z_region_data, region_mean)
             )
             # slope (only for practice_correction == 2)
             if practice_correction == 2:
-                sigma_slope = pm.HalfNormal("sigma_slope", practice_slopes_std)
-                slope_re_offset = pm.Normal("slope_re_offset", 0.0, 1.0, shape=len(slope_practices))
+                sigma_slope = pm.HalfNormal("sigma_slope", 0.25)
+                slope_re_offset = pm.Normal("slope_re_offset", 0.0, 1.0,
+                                            shape=len(slope_practices))
                 slope_re = pm.Deterministic("slope_re", slope_re_offset * sigma_slope)
                 practice_slope_term = pm.math.dot(Z_practice_slope_data,
                                                   slope_re[:, None]).squeeze()
             else:
                 practice_slope_term = 0.0
 
-        # fixed effects
-        if individual_priors:
-            beta_sigma_data = pm.Data("beta_sigma", beta_sigma)
+        # seasonal (month) effects: sum-to-zero for deseasonalisation
+        if deseasonalise_output:
+            sigma_month = pm.HalfNormal("sigma_month", 0.3)
+            month_raw = pm.Normal("month_raw", 0.0, 1.0, shape=12)
+
+            month_effect = pm.Deterministic("month_effect",
+                                            (month_raw - month_raw.mean()) * sigma_month
+            )
+            month_term = month_effect[month_idx_data]
         else:
-            beta_sigma_data = 2.0
-        beta = pm.Normal("beta", mu=0.0, sigma=beta_sigma_data, shape=X_fixed.shape[1])
-        eta = intercept + \
+            month_term = 0.0
+
+        # fixed effects
+        tau_env = pm.HalfNormal("tau_env", 0.5)
+        beta_env = pm.Normal("beta_env", mu=0.0, sigma=tau_env, shape=len(env_idx))
+        beta_flood = pm.Normal("beta_flood", mu=0.0, sigma=1.0, shape=len(flood_idx))
+        # beta_month = pm.Normal("beta_month", mu=0.0, sigma=0.5, shape=len(month_idx))
+
+        # assemble full beta vector
+        beta_list = []
+        for i in range(X_fixed.shape[1]):
+            if i in env_idx:
+                beta_list.append(beta_env[env_idx.index(i)])
+            elif i in flood_idx:
+                beta_list.append(beta_flood[flood_idx.index(i)])
+            # elif i in month_idx:
+            #     beta_list.append(beta_month[month_idx.index(i)])
+            else:
+                raise ValueError(f"Variable {fixed_cols[i]} not categorised for beta assembly")
+        beta = pm.Deterministic("beta", pm.math.stack(beta_list, axis=0))
+
+        # assemble full beta vector in original column order
+        eta = size_intercept + \
               practice_intercept + \
               practice_slope_term + \
+              month_term + \
               pm.math.dot(X_fixed_data, beta)
 
         # residual
@@ -1494,6 +1526,15 @@ def run_bayesian_model(
     for group in drop_groups:
         if group in idata.groups():
             del idata[group]
+    
+    # recombined beta objects
+    drop_beta_components = [
+        "beta_env",
+        "beta_flood",
+        # "beta_month",
+    ]
+    existing = [v for v in drop_beta_components if v in idata.posterior.data_vars]
+    idata.posterior = idata.posterior.drop_vars(existing)
 
     # restructure inference data for named predictors
     beta_da = idata.posterior["beta"]
@@ -1509,8 +1550,8 @@ def run_bayesian_model(
         hierarchical_mappings = {
             "region_mean": REGION_NAMES,
             "region_raw": REGION_NAMES,
-            "size_mean": PRACTICE_SIZES,
-            "size_raw": PRACTICE_SIZES,
+            "alpha_size": PRACTICE_SIZES,
+            "month_effect": MONTHS,
         }
         new_vars = {}
         vars_to_drop = []
@@ -1818,7 +1859,6 @@ def generate_bayesian_diagnostics(idata, results_folder, max_subplots=40):
         "size_raw",
         "practice_offset",
         "slope_re_offset",
-        "beta_sigma",
     }
     posterior_vars = [var for var in idata.posterior.data_vars
                       if var not in re_vars
@@ -1901,6 +1941,17 @@ def generate_bayesian_diagnostics(idata, results_folder, max_subplots=40):
     else:
         status(f"Warning: no posterior predictive data found in idata, skipping PPC.", level=2)
     status(f"All Bayesian diagnostic plots saved to {results_folder}", level=2)
+
+def classify_beta(name: str) -> str:
+    name = name.lower()
+    if "flood" in name:
+        return "flood"
+    if "_almon_basis_" in name:
+        parent = name.split("_almon_basis_")[0]
+        return classify_beta(parent)
+    if name.startswith("month["):
+        return "month"
+    return "environmental"
 
 
 
@@ -2035,7 +2086,9 @@ def compare_bayesian_models(results_root):
             r"^Intercept$|^sigma(?:$|_)|"
             r"^sigma_|^region_|^size_|^practice_|"
             r"_raw$|_offset$|"
-            r"^slope_re$|^slope_re_offset$"
+            r"^slope_re$|^slope_re_offset$|"
+            r"^alpha_size(?:\[.*\])?$|"
+            r"^mu_alpha$|^tau_env$"
         )
         df = df[~df["name"].str.contains(exclude_pattern, regex=True)]
 

@@ -4,9 +4,9 @@ import matplotlib.pyplot as plt
 from funcs import clean_prescription_items
 
 ds = xr.open_dataset("data/prescriptions_02_03_0501_2010-08_2025-08_with_flags.nc")
+ds_clean = clean_prescription_items(ds)
 
 # plot example time series of items with values removed
-ds_clean = clean_prescription_items(ds)
 fig, axes = plt.subplots(5, 5, figsize=(15, 10))
 for i, ax in enumerate(axes.flatten()):
     if i < ds.dims['practice_id']:
@@ -45,7 +45,7 @@ fig3 = plt.figure(figsize=(10, 6))
 bins = np.linspace(0.1, np.nanmax(np.log1p(high_vals)), 50)
 plt.hist(np.log1p(low_vals), bins=bins, alpha=0.5, color='blue', label='Low mean practices')
 plt.hist(np.log1p(high_vals), bins=bins, alpha=0.5, color='red', label='High mean practices')
-plt.xticks(np.arange(0, 10), np.expm1(np.arange(0, 10)).astype(int))
+plt.xticks(np.arange(0, 10)) #, np.expm1(np.arange(0, 10)).astype(int))
 fig3.tight_layout()
 fig3.savefig("outputs/item_restriction_groups.png")
 
