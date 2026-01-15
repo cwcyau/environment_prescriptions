@@ -900,7 +900,7 @@ def run_mixed_effects_models(
     # build base dataframe
     status("Preparing DataFrame for modeling...", level=1)
     df_items = (
-    ds[["items", "date_code", "practice_size", "region", "imd_centile_values"]]
+    ds[["items", "date_code", "region", "imd_centile_values"]]
         .to_dataframe()
         .reset_index()
     )
@@ -910,6 +910,12 @@ def run_mixed_effects_models(
     # transform prescription items
     df_items = df_items.rename(columns={"items": "items_raw"})
     df_items["items_log"] = np.log1p(df_items["items_raw"])
+    # make IMD time-invariant: practice-level mean
+    df_items["imd_centile_values"] = (
+        df_items
+        .groupby("practice_id")["imd_centile_values"]
+        .transform("mean")
+    )
     # get indices
     df_items = df_items.set_index(["date", "practice_id"])
     df_index = df_items.index
@@ -976,7 +982,8 @@ def run_mixed_effects_models(
             "imd_p": np.nan,
 
             # region effects: store dictionaries indexed by category
-            "region_main": {},             # region → {coef, ci_low, ci_high, p}
+            "region_main": {},
+            "month_main": {},
 
             # metadata
             "n_practices": 0,
@@ -988,8 +995,7 @@ def run_mixed_effects_models(
         # construct df_model with required predictor column(s)
         df_model = df_items[["items_raw", "items_log",
                              "month", "date_code",
-                             "practice_size", "region",
-                             "imd_centile_values"]].copy()
+                             "region", "imd_centile_values"]].copy()
         df_model["practice_id"] = df_model.index.get_level_values("practice_id")
 
         # handling for the various predictor types
@@ -1070,15 +1076,15 @@ def run_mixed_effects_models(
 
         # add practice covariates
         formula = f"items_log ~ {pred_term} + imd_centile_values"
-        formula += " + C(region, Treatment(reference=\"South East\")) + C(practice_size)"
+        formula += " + C(region, Sum)"
 
         # seasonal correction term (if requested)
         if deseasonalise_output:
-            formula = formula + " + C(month)"
+            formula = formula + " + C(month, Sum)"
 
         # restrict df_model to required columns
         required_cols = ["items_log", pred_term, "imd_centile_values",
-                         "region", "practice_size"]
+                         "region"]
         df_model = df_model.dropna(subset=required_cols).copy()
 
         # filter to practices with enough observations
@@ -1124,10 +1130,23 @@ def run_mixed_effects_models(
         # region effects
         for term in mdf.params.index:
             if term.startswith("C(region"):
-                region = term.split("[T.")[1][:-1]
+                region = term.split("[")[1].rstrip("]")
                 beta = mdf.params.get(term, np.nan)
                 cis = tuple(percent_from_log(x) for x in safe_ci(mdf, term))
                 out["region_main"][region] = {
+                    "coef": percent_from_log(beta),
+                    "ci_low": cis[0],
+                    "ci_high": cis[1],
+                    "p": float(mdf.pvalues.get(term, np.nan)),
+                }
+
+        # month effects
+        for term in mdf.params.index:
+            if term.startswith("C(month"):
+                month = term.split("[")[1].rstrip("]")  # get month number as string
+                beta = mdf.params.get(term, np.nan)
+                cis = tuple(percent_from_log(x) for x in safe_ci(mdf, term))
+                out["month_main"][month] = {
                     "coef": percent_from_log(beta),
                     "ci_low": cis[0],
                     "ci_high": cis[1],
@@ -1395,7 +1414,6 @@ def run_bayesian_model(
         if deseasonalise_output:
             sigma_month = pm.HalfNormal("sigma_month", 0.3)
             month_raw = pm.Normal("month_raw", 0.0, 1.0, shape=12)
-
             month_effect = pm.Deterministic("month_effect",
                                             (month_raw - month_raw.mean()) * sigma_month
             )
@@ -2051,19 +2069,40 @@ def compare_mixed_models(results_folder, save_folder, legend_y_offset_px=42):
                     "ci_high": val["ci_high"],
                     "pres_code": code
                 })
-    # find the reference region
-    unique_regions = set(r["name"] for r in region_dfs)
-    ref_region = unique_regions.symmetric_difference(set(REGION_NAMES))
-    ref_region = next(iter(ref_region), "")
     # plot
     region_dfs = pd.DataFrame(region_dfs)
     region_df_list = [region_dfs[region_dfs["pres_code"] == code] for code in PRES_CODES]
     fig_region, ax_region = plot_combined(region_df_list, PRES_LABELS, PRES_COLOURS,
-                                          x_label=f"Effect relative to {ref_region} (%)",
+                                          x_label=f"Deviation from national mean (%)",
                                           region_plot=True, order=REGION_NAMES)
     add_legend(fig_region, ax_region, labels=PRES_LABELS, legend_y_offset_px=legend_y_offset_px)
     fig_region.savefig(os.path.join(save_folder, "mixed_region.png"), dpi=600, bbox_inches='tight')
     plt.close(fig_region)
+
+    # month effects
+    month_dfs = []
+    for code, df in all_results.items():
+        for _, row in df.iterrows():
+            month_dict = ast.literal_eval(row.get("month_main", "{}"))
+            for month_num_str, val in month_dict.items():
+                # convert to int index
+                month_idx = int(month_num_str) - 1  # month T.1 -> 0, T.2 -> 1, etc.
+                month_dfs.append({
+                    "name": MONTHS[month_idx],
+                    "coef": val["coef"],
+                    "ci_low": val["ci_low"],
+                    "ci_high": val["ci_high"],
+                    "pres_code": code
+                })
+    # plot
+    month_dfs = pd.DataFrame(month_dfs)
+    month_df_list = [month_dfs[month_dfs["pres_code"] == code] for code in PRES_CODES]
+    fig_month, ax_month = plot_combined(month_df_list, PRES_LABELS, PRES_COLOURS,
+                                        x_label="Deviation from annual mean (%)",
+                                        order=MONTHS)
+    add_legend(fig_month, ax_month, labels=PRES_LABELS, legend_y_offset_px=legend_y_offset_px)
+    fig_month.savefig(os.path.join(save_folder, "mixed_months.png"), dpi=600, bbox_inches='tight')
+    plt.close(fig_month)
 
 def compare_bayesian_models(results_root):
     results_folders = [os.path.join(results_root, c) for c in PRES_CODES]
