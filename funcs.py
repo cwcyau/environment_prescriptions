@@ -1214,7 +1214,7 @@ def run_bayesian_model(
     # prepare dataframe ===========================================================================
     status("Preparing dataframe for model input...", level=1)
     df = ds[
-            ["items", "date_code", "region", "practice_size"] + raw_vars
+            ["items", "date_code", "region"] + raw_vars
         ].to_dataframe().reset_index()
     df["date"] = pd.to_datetime(df["date"])
     df["month"] = df["date"].dt.month
@@ -1273,32 +1273,6 @@ def run_bayesian_model(
                 colname = f"{var}_almon_basis_{j}"
                 df[colname] = M[:, j]
 
-    # # identify continuous and categorical predictors
-    # categorical_vars = []
-    # if deseasonalise_output:
-    #     categorical_vars.append("month")
-
-    # # map categorical codes for CSV later
-    # cat_code_maps = {}
-    # for cat in categorical_vars:
-    #     # reference category at end of categories list
-    #     if cat == "month":
-    #         ref = "September"
-    #         num_ref = MONTHS.index(ref) + 1
-    #         categories = [m for m in range(1, 13) if m != num_ref] + [num_ref]
-    #         cat_code_maps[cat] = pd.Categorical(df[cat], categories=categories)
-    #     else:
-    #         cat_code_maps[cat] = pd.Categorical(df[cat])
-
-    # # warn for missing categories
-    # for cat, cat_obj in cat_code_maps.items():
-    #     present = set(df[cat].unique())
-    #     expected = list(cat_obj.categories)
-    #     missing = [c for c in expected if c not in present]
-    #     if missing:
-    #         status(f"Warning: for categorical {cat}, these levels were NOT present in data: {missing}",
-    #                level=1)
-
     # precompute and combine design matrics =======================================================
     status("Building combined design matrices and gathering statistics...", level=1)
     fixed_cols = []  # for column names in X_fixed
@@ -1326,25 +1300,10 @@ def run_bayesian_model(
                 fixed_cols.append(var)
                 X_fixed_list.append(df[var].values.astype("float32").reshape(-1, 1))
 
-    # # categorical predictors
-    # cat_col_slices = {}
-    # for cat in categorical_vars:
-    #     cat_obj = pd.Categorical(df[cat], categories=cat_code_maps[cat].categories)
-    #     levels = list(cat_obj.categories)
-    #     cat_codes = pd.get_dummies(cat_obj, prefix=cat, drop_first=False)
-    #     ref_level = levels[-1]
-    #     ref_col = f"{cat}_{ref_level}"
-    #     # keep only non-reference columns
-    #     nonref_cols = [c for c in cat_codes.columns if c != ref_col]
-    #     nonref_levels = [lvl for lvl in levels if lvl != ref_level]
-    #     cat_codes_nonref = cat_codes[nonref_cols]
-    #     fixed_cols.extend([f"{cat}[{lvl}]" for lvl in nonref_levels])
-    #     X_fixed_list.append(cat_codes_nonref.values.astype("float32"))
-    #     cat_col_slices[cat] = (len(fixed_cols) - cat_codes_nonref.shape[1], len(fixed_cols))
-
     # prepare data arrays
     X_fixed = np.concatenate(X_fixed_list, axis=1).astype("float32")
     y_obs = df["items_log"].values.astype("float32")
+    y_mean = df["items_log"].mean()
     practice_idx = pd.Categorical(df["practice_id"]).codes.astype("int32")
     n_practice = int(df["practice_id"].nunique())
     date_code = df["date_code"].values.astype("float32")
@@ -1361,9 +1320,7 @@ def run_bayesian_model(
 
     # prepare practice covariates
     region_idx = pd.Categorical(df["region"], categories=REGION_NAMES).codes
-    size_idx = pd.Categorical(df["practice_size"], categories=PRACTICE_SIZES).codes
     n_region = len(REGION_NAMES)
-    n_size = len(PRACTICE_SIZES)
     n_obs = len(df)
 
     # random effect design matrices
@@ -1373,19 +1330,13 @@ def run_bayesian_model(
         shape=(n_obs, n_practice)
     ).astype("float32")
     # slope RE only for practices with sufficient observations
-    sufficient_obs = df.groupby("practice_id").size() > min_obs_for_slope
-    slope_practices = sufficient_obs[sufficient_obs].index  # only these get slope RE
-    slope_rows = df["practice_id"].isin(slope_practices)
-    Z_practice_slope = sp.csr_matrix(
-        (np.ones(slope_rows.sum(), dtype="float32"),
-        (np.where(slope_rows)[0],
-        pd.Categorical(df.loc[slope_rows, "practice_id"], categories=slope_practices).codes)),
-        shape=(len(df), len(slope_practices))
-    )
-    Z_practice_slope = Z_practice_slope.multiply(date_code[:, None]).tocsr().astype("float32")
-    # use dense matrices for region and size random effects (few levels)
-    Z_region_data = np.eye(n_region, dtype="float32")[region_idx]
-    Z_size_data   = np.eye(n_size,   dtype="float32")[size_idx]
+    practice_counts_for_slope = df.groupby("practice_id").size()
+    slope_practices = practice_counts_for_slope[practice_counts_for_slope > min_obs_for_slope].index
+    slope_mask = df["practice_id"].isin(slope_practices).astype("float32").values
+    slope_practice_idx = pd.Categorical(
+        df["practice_id"].where(df["practice_id"].isin(slope_practices))
+    ).codes.astype("int32")
+    Z_region = np.eye(n_region, dtype="float32")[region_idx]
 
     # categorise fixed effect columns
     env_idx   = [i for i, n in enumerate(fixed_cols) if classify_beta(n) == "environmental"]
@@ -1399,57 +1350,48 @@ def run_bayesian_model(
         X_fixed_data = pm.Data("X_fixed", X_fixed)
         y_obs_data = pm.Data("y_obs", y_obs)
         Z_practice_data = pts.as_sparse_variable(Z_practice)
-        Z_practice_slope_data = pts.as_sparse_variable(Z_practice_slope)
-        Z_region_data = pm.Data("Z_region", Z_region_data)
-        Z_size_data = pm.Data("Z_size", Z_size_data)
-        size_idx_data = pm.Data("size_idx", size_idx)
+        Z_region_data = pm.Data("Z_region", Z_region)
         month_idx_data = pm.Data("month_idx", month_idx)
+        slope_mask_data = pm.Data("slope_mask", slope_mask)
+        slope_practice_idx_data = pm.Data("slope_practice_idx",
+                                          slope_practice_idx.astype("int32"))
+        date_code_data = pm.Data("date_code", date_code)
 
-        # practice-size-specific intercepts
-        mu_alpha = pm.Normal("mu_alpha", 6.0, 2.0)  # mid-point between small and large practices in log-space
-        sigma_alpha = pm.HalfNormal("sigma_alpha", 2.0)  # intercept variability between practice sizes in log-space
-        alpha_size = pm.Normal(
-            "alpha_size",
-            mu=mu_alpha,
-            sigma=sigma_alpha,
-            shape=n_size
+        # global intercept
+        alpha = pm.Normal("alpha", mu=y_mean, sigma=1.0)
+
+        # region-level intercepts
+        sigma_region = pm.HalfNormal("sigma_region", 0.5)
+        region_raw = pm.Normal("region_raw", 0.0, 1.0, shape=n_region)
+        region_mean = pm.Deterministic(
+            "region_mean", (region_raw - region_raw.mean()) * sigma_region
         )
-        size_intercept = alpha_size[size_idx_data]
+        region_term = pm.math.dot(Z_region_data, region_mean)
 
         # random effects
         if practice_correction == 0:
             practice_intercept = 0.0
             practice_slope_term = 0.0
         else:
-            # region-level intercepts
-            sigma_region = pm.HalfNormal("sigma_region", 0.5)
-            region_raw = pm.Normal("region_raw", 0.0, 1.0, shape=n_region)
-            region_mean = pm.Deterministic(
-                "region_mean", (region_raw - region_raw.mean()) * sigma_region
-            )
-            # practice-level deviations (non-centred)
+            # practice-level intercepts (non-centred)
             sigma_practice = pm.HalfNormal("sigma_practice", 1.0)
-            practice_offset = pm.Normal("practice_offset", 0.0, 1.0, shape=n_practice)
-            # intercept
+            practice_intercept_offset = pm.Normal("practice_intercept_offset", 0.0, 1.0, shape=n_practice)
             practice_intercept = (
                 pm.math.dot(
                     Z_practice_data,
-                    (practice_offset * sigma_practice)[:, None]
-                ).squeeze() +
-                pm.math.dot(Z_region_data, region_mean)
+                    (practice_intercept_offset * sigma_practice)[:, None]
+                ).squeeze()
             )
-            # slope (only for practice_correction == 2)
+            # practice-level slopes (only for practice_correction == 2)
             if practice_correction == 2:
-                sigma_slope = pm.HalfNormal("sigma_slope", 0.25)
-                slope_re_offset = pm.Normal("slope_re_offset", 0.0, 1.0,
-                                            shape=len(slope_practices))
-                slope_re = pm.Deterministic("slope_re", slope_re_offset * sigma_slope)
-                practice_slope_term = pm.math.dot(Z_practice_slope_data,
-                                                  slope_re[:, None]).squeeze()
+                sigma_slope = pm.HalfNormal("sigma_slope", 0.5)
+                practice_slope_offset = pm.Normal("practice_slope_offset", 0.0, 1.0, shape=len(slope_practices))
+                slope_re = practice_slope_offset * sigma_slope
+                practice_slope_term = slope_mask_data * slope_re[slope_practice_idx_data] * date_code_data
             else:
                 practice_slope_term = 0.0
 
-        # seasonal (month) effects: sum-to-zero for deseasonalisation
+        # seasonal effects
         if deseasonalise_output:
             sigma_month = pm.HalfNormal("sigma_month", 0.3)
             month_raw = pm.Normal("month_raw", 0.0, 1.0, shape=12)
@@ -1480,8 +1422,9 @@ def run_bayesian_model(
                 raise ValueError(f"Variable {fixed_cols[i]} not categorised for beta assembly")
         beta = pm.Deterministic("beta", pm.math.stack(beta_list, axis=0))
 
-        # assemble full beta vector in original column order
-        eta = size_intercept + \
+        # full eta equation
+        eta = alpha + \
+              region_term + \
               practice_intercept + \
               practice_slope_term + \
               month_term + \
@@ -1520,19 +1463,8 @@ def run_bayesian_model(
             )
 
     # save inference data =========================================================================
-    # drop unnecessary groups
-    drop_groups = ["log_likelihood", "prior", "prior_predictive",
-                   "constant_data", "sample_stats_prior"]
-    for group in drop_groups:
-        if group in idata.groups():
-            del idata[group]
-    
     # recombined beta objects
-    drop_beta_components = [
-        "beta_env",
-        "beta_flood",
-        # "beta_month",
-    ]
+    drop_beta_components = ["beta_env", "beta_flood"]
     existing = [v for v in drop_beta_components if v in idata.posterior.data_vars]
     idata.posterior = idata.posterior.drop_vars(existing)
 
@@ -1550,8 +1482,8 @@ def run_bayesian_model(
         hierarchical_mappings = {
             "region_mean": REGION_NAMES,
             "region_raw": REGION_NAMES,
-            "alpha_size": PRACTICE_SIZES,
             "month_effect": MONTHS,
+            "month_raw": MONTHS,
         }
         new_vars = {}
         vars_to_drop = []
@@ -1574,23 +1506,20 @@ def run_bayesian_model(
     if lag > 0:
         lag_effect_vars = {}
         for var in lag_vars:
-            basis_names = [
-                name for name in fixed_cols
-                if name.startswith(f"{var}_almon_basis_")
-            ]
+            basis_names = [name for name in idata.posterior
+                            if name.startswith(f"{var}_almon_basis_")]
             if not basis_names:
                 continue
+            basis_post = xr.concat([idata.posterior[name] for name in basis_names],
+                                    dim="basis")
             for l in range(lag + 1):
-                weights = almon_X[l, :len(basis_names)]
-                effect = sum(
-                    idata.posterior[name] * w
-                    for name, w in zip(basis_names, weights)
-                )
+                weights = almon_X[l, :basis_post.sizes["basis"]]
+                effect = (basis_post * xr.DataArray(weights, dims=["basis"])).sum(dim="basis")
                 lag_effect_vars[f"{var}_lag_effect[{l}]"] = effect
+
         if lag_effect_vars:
-            idata.posterior = xr.merge(
-                [idata.posterior, xr.Dataset(lag_effect_vars)]
-            )
+            idata.posterior = xr.merge([idata.posterior,
+                                        xr.Dataset(lag_effect_vars)])
 
     # save posterior summary with categorical names
     summary_df = az.summary(idata, hdi_prob=0.95)
@@ -1655,11 +1584,6 @@ def prepare_ds(
     # add date code as simpler data variable for models
     ds["date_code"] = ("date", np.arange(len(ds["date"])))  # integer months since start
     ds["date_code"] = (ds["date_code"] - ds["date_code"].mean()) / ds["date_code"].std()  # standardised
-
-    # add practice size (creates two groups, large and small, with roughly normal distributions)
-    practice_means = ds["items"].mean(dim="date")
-    ds["practice_size"] = ("practice_id", np.where(practice_means >= practice_mean_thresh,
-                                                   "large", "small"))
     
     # exclude random single welsh practice
     ds = ds.isel(practice_id=ds["region"] != "Wales")
@@ -1834,11 +1758,10 @@ def generate_bayesian_diagnostics(idata, results_folder, max_subplots=40):
 
     # combine intercept and slope RE if available
     re_vars = []
-    if "practice_offset" in idata.posterior.data_vars:
-        re_vars.append("practice_offset")
-    if "slope_re" in idata.posterior.data_vars:
-        re_vars.append("slope_re")
-        re_vars.append("slope_re_offset")
+    if "practice_intercept_offset" in idata.posterior.data_vars:
+        re_vars.append("practice_intercept_offset")
+    if "practice_slope_offset" in idata.posterior.data_vars:
+        re_vars.append("practice_slope_offset")
 
     # compute rhat for all random effects
     worst_re_coords = {}
@@ -1857,8 +1780,8 @@ def generate_bayesian_diagnostics(idata, results_folder, max_subplots=40):
     exclude = {  # exclude these as diagnostics uninformative
         "region_raw",
         "size_raw",
-        "practice_offset",
-        "slope_re_offset",
+        "practice_intercept_offset",
+        "practice_slope_offset",
     }
     posterior_vars = [var for var in idata.posterior.data_vars
                       if var not in re_vars
@@ -1939,7 +1862,14 @@ def generate_bayesian_diagnostics(idata, results_folder, max_subplots=40):
         plt.savefig(os.path.join(results_folder, "ppc.png"), bbox_inches='tight')
         plt.close(fig='all')
     else:
-        status(f"Warning: no posterior predictive data found in idata, skipping PPC.", level=2)
+        status(
+            "No posterior predictive found. "
+            "Falling back to marginal likelihood and scaled residual diagnostics.",
+            level=2,
+        )
+        plot_marginal_likelihood_check(idata, results_folder)
+        plot_scaled_residuals(idata, results_folder)
+
     status(f"All Bayesian diagnostic plots saved to {results_folder}", level=2)
 
 def classify_beta(name: str) -> str:
@@ -1952,6 +1882,74 @@ def classify_beta(name: str) -> str:
     if name.startswith("month["):
         return "month"
     return "environmental"
+
+def plot_marginal_likelihood_check(idata, results_folder, n_samples=500):
+    y_obs = idata.observed_data["items_obs"].values
+
+    # pick a random subset of posterior samples
+    posterior = idata.posterior
+    n_draws_total = posterior.sizes["chain"] * posterior.sizes["draw"]
+    sample_idx = np.random.choice(n_draws_total, min(n_samples, n_draws_total), replace=False)
+
+    # extract mu_alpha and sigma for these draws
+    mu_all = posterior["mu_alpha"].stack(sample=("chain", "draw")).values[sample_idx]
+    sigma_all = posterior["sigma"].stack(sample=("chain", "draw")).values[sample_idx]
+
+    # simulate y ~ Normal(mu, sigma) for each sampled draw independently
+    sim = np.random.normal(loc=mu_all, scale=sigma_all)
+
+    plt.figure(figsize=(6, 4))
+    plt.hist(y_obs, bins=50, density=True, alpha=0.6, label="Observed (log)")
+    plt.hist(sim, bins=50, density=True, alpha=0.6,
+             label="Model-implied marginal")
+    plt.xlabel("log(1 + items)")
+    plt.ylabel("Density")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_folder, "ppc_marginal.png"),
+                bbox_inches="tight")
+    plt.close()
+
+def plot_scaled_residuals(idata, results_folder, n_draws=500, n_obs_sample=5000):
+    y_obs = idata.observed_data["items_obs"].values
+    n_obs = len(y_obs)
+
+    # stack posterior samples
+    posterior = idata.posterior
+    total_draws = posterior.sizes["chain"] * posterior.sizes["draw"]
+    
+    # randomly select n_draws from posterior
+    draw_idx = np.random.choice(total_draws, min(n_draws, total_draws), replace=False)
+    mu_all = posterior["mu_alpha"].stack(sample=("chain", "draw")).values[draw_idx]
+    sigma_all = posterior["sigma"].stack(sample=("chain", "draw")).values[draw_idx]
+
+    # optionally sample observations for speed
+    if n_obs_sample < n_obs:
+        obs_idx = np.random.choice(n_obs, n_obs_sample, replace=False)
+        y_sample = y_obs[obs_idx]
+    else:
+        y_sample = y_obs
+
+    # compute scaled residuals for sampled draws and obs
+    z_list = []
+    for mu, sigma in zip(mu_all, sigma_all):
+        z_list.append((y_sample - mu) / sigma)
+    z = np.concatenate(z_list)
+
+    plt.figure(figsize=(6, 4))
+    plt.hist(z, bins=100, density=True, alpha=0.7, label="Scaled residuals")
+
+    x = np.linspace(-4, 4, 200)
+    plt.plot(x, np.exp(-0.5 * x**2) / np.sqrt(2 * np.pi),
+             lw=2, label="Standard Normal")
+
+    plt.xlabel("z")
+    plt.ylabel("Density")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(results_folder, "residuals_scaled.png"),
+                bbox_inches="tight")
+    plt.close()
 
 
 
@@ -2083,10 +2081,10 @@ def compare_bayesian_models(results_root):
 
         # exclude random effects
         exclude_pattern = (
-            r"^Intercept$|^sigma(?:$|_)|"
-            r"^sigma_|^region_|^size_|^practice_|"
+            r"^alpha$|^Intercept$|^sigma(?:$|_)|"
+            r"^sigma_|^region_|^size_|^month_|^practice_|"
             r"_raw$|_offset$|"
-            r"^slope_re$|^slope_re_offset$|"
+            r"^slope_re$|^practice_slope_offset$|"
             r"^alpha_size(?:\[.*\])?$|"
             r"^mu_alpha$|^tau_env$"
         )
@@ -2095,10 +2093,20 @@ def compare_bayesian_models(results_root):
         # identify lagged variables
         lagged_rows = df[df["name"].str.contains(r"_lag_effect\[\d+\]")].copy()
         if not lagged_rows.empty:
+            # extract variable name and lag
             lagged_rows["variable"] = lagged_rows["name"].str.replace(
                 r"_lag_effect\[\d+\]", "", regex=True
             )
             lagged_rows["lag"] = (lagged_rows["name"].str.extract(r"\[(\d+)\]").astype(int))
+
+            # add non-lagged variables with lag = 0
+            non_lagged_rows = df[df["name"].str.endswith("_values")].copy()
+            if not non_lagged_rows.empty:
+                non_lagged_rows["variable"] = non_lagged_rows["name"]
+                non_lagged_rows["lag"] = 0
+            
+            # combine
+            lagged_rows = pd.concat([lagged_rows, non_lagged_rows], ignore_index=True)
             lagged_dataframes.append(lagged_rows)
             lagged_data_inds.append(i)
 
@@ -2475,7 +2483,6 @@ def plot_months_bayes(results_folders, plot_root):
     month_dfs = []
     labels = []
     colours = []
-    ref_month_idx = None
     for i, folder in enumerate(results_folders):
         # load csv data
         summary_path = os.path.join(folder, "bayesian_model_summary.csv")
@@ -2484,46 +2491,15 @@ def plot_months_bayes(results_folders, plot_root):
         df = pd.read_csv(summary_path).rename(columns={"parameter": "name"})
 
         # extract month coefficients
-        month_rows = df[df["name"].str.match(r"^month\[\d+\]$")].copy()
+        month_rows = df[df["name"].str.startswith("month_effect[")].copy()
         if month_rows.empty:
             continue
-        month_rows["month_idx"] = (
-            month_rows["name"]
-            .str.extract(r"\[(\d+)\]")
-            .astype(int)
-        )
-
-        # detect reference month (the missing one)
-        present = set(month_rows["month_idx"])
-        missing = sorted(set(range(1, 13)) - present)
-        if len(missing) != 1:
-            raise ValueError(
-                f"Could not uniquely determine reference month in {folder}: {missing}"
-            )
-
-        # enforce consistency across prescriptions
-        if ref_month_idx is None:
-            ref_month_idx = missing[0]
-        elif ref_month_idx != missing[0]:
-            raise ValueError(
-                "Reference month differs across prescriptions - models are not comparable."
-            )
-
-        # build plotting dataframe
-        month_rows["name"] = month_rows["month_idx"].apply(
-            lambda m: MONTHS[m - 1]
-        )
-        month_rows = month_rows.rename(
-            columns={
-                "mean_pct": "coef",
-                "hdi_2.5pc_pct": "ci_low",
-                "hdi_97.5pc_pct": "ci_high",
-            }
-        )
+        month_rows["name"] = month_rows["name"].str.replace(r"month_effect\[(.*)\]", r"\1", regex=True)
 
         # add to list
         month_dfs.append(
-            month_rows[["name", "coef", "ci_low", "ci_high"]]
+            month_rows[["name", "mean_pct",
+                        "hdi_2.5pc_pct", "hdi_97.5pc_pct"]]
         )
         labels.append(PRES_LABELS[i])
         colours.append(PRES_COLOURS[i])
@@ -2531,18 +2507,17 @@ def plot_months_bayes(results_folders, plot_root):
     if not month_dfs:
         status("No month data found.", level=1)
         return
-    ref_month_name = MONTHS[ref_month_idx - 1]
 
     # plot combined month effects
     fig, ax = plot_combined(
         df_list=month_dfs,
         labels_list=labels,
         colours_list=colours,
-        x_label=f"Effect relative to {ref_month_name} (%)",
+        x_label=f"Deviation from annual mean (%)",
         order=MONTHS,
-        col_est="coef",
-        col_low="ci_low",
-        col_high="ci_high",
+        col_est="mean_pct",
+        col_low="hdi_2.5pc_pct",
+        col_high="hdi_97.5pc_pct",
     )
 
     # finalise plot
@@ -2660,6 +2635,10 @@ def var_name_to_plot_name(var_name):
                 name_list.remove("Effect[0]")
             if "Effect[1]" in name_list:
                 name_list.remove("Effect[1]")
+        # rename month effects
+        if "Month" in name_list:
+            name_list.remove("Month")
+            name_list[0] = name_list[0].replace("Effect[", "").replace("]", "")
         
         # replace categorical variable
         if name_list[0].startswith("C("):

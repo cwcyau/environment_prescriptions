@@ -66,6 +66,8 @@ parser.add_argument('--no_gpu', dest='use_gpu', action='store_false')
 parser.set_defaults(use_gpu=False)
 parser.add_argument('--practice_correction', type=int, default=1,
                     help="Practice correction level: 0 = none, 1 = intercept only, 2 = intercept + slope, 3 = intercept + slope + correlation (default: 1).")
+parser.add_argument('--results_folder_name', type=str, default="bayes_standard",
+                    help="Name of the results folder (default: bayes_standard).")
 args = parser.parse_args()
 use_gpu = args.use_gpu
 lag = args.lag
@@ -78,6 +80,7 @@ if n_practices == 0:
 chains = args.chains
 cores = args.cores
 practice_correction = args.practice_correction
+results_folder_name = args.results_folder_name
 
 # data preparation parameters
 # n_practices = None  # limit to n randomly selected practices (None for all practices)
@@ -92,17 +95,14 @@ min_obs_per_practice = 20  # practices with fewer points will be excluded (after
 almon_order = 1  # order of almon lag polynomial (only used if lag > 0)
 # practice_correction = 1  # 0 = none, 1 = intercept only, 2 = intercept + slope, 3 = intercept + slope + correlation (keep as 2 as runs within walltime)
 deseasonalise_output = True  # whether to include a seasonal correction term for output variable (items) (always True as adding seasonal term is inexpensive)
-likelihood = "normal"  # likelihood to use: "normal" or "studentt"
+likelihood = "studentt"  # likelihood to use: "normal" or "studentt"
 # draws = 2000  # number of MCMC draws
 # tune = 2000  # number of tuning steps
 # chains = 8  # number of MCMC chains
 # cores = 1  # number of CPU cores to use
 
 # set folder name for outputs
-if lag > 0:
-    results_folder = f"outputs/bayes_lagged_{lag}/{prescription_code}/"
-else:
-    results_folder = f"outputs/bayes_standard/{prescription_code}/"
+results_folder = f"outputs/{results_folder_name}/{prescription_code}/"
 
 # names of values to analyse
 # predictors = [  # full set
