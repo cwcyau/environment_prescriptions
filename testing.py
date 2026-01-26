@@ -179,24 +179,29 @@
 # plt.show()
 
 
+
+
+
+
+
+
 import numpy as np
 import matplotlib.pyplot as plt
 import xarray as xr
-from funcs import clean_prescription_items
+from funcs import clean_prescription_items, prepare_ds
 
-files = [f"data/prescriptions_{ptype}_2010-08_2025-08_with_flags.nc" for ptype in ["02_03_0501", "02", "03", "0501"]]
-fig, axes = plt.subplots(2, 2, figsize=(10, 8))
-for file, ax in zip(files, axes.flatten()):
-    ds = xr.open_dataset(file)
-    ds_clean = clean_prescription_items(ds)
-    practice_means = ds_clean['items'].mean(dim='date')
-    split = np.median(practice_means.values) - 4*np.std(practice_means.values)/5
-    small_prac = ds_clean.isel(practice_id=practice_means < split)
-    large_prac = ds_clean.isel(practice_id=practice_means >= split)
-    bins = np.linspace(0, np.nanmax(np.log1p(ds['items'].values)), 50)
-    ax.hist(np.log1p(ds['items'].values.flatten()), bins=bins, alpha=0.5, label='Original')
-    ax.hist(np.log1p(ds_clean['items'].values.flatten()), bins=bins, alpha=0.5, label='Cleaned')
-    ax.hist(np.log1p(small_prac['items'].values.flatten()), bins=bins, alpha=0.5, label='Small Practices')
-    ax.hist(np.log1p(large_prac['items'].values.flatten()), bins=bins, alpha=0.5, label='Large Practices')
+file = "data/prescriptions_02_03_0501_2010-08_2025-08_with_flags.nc"
 
-plt.savefig("testing.png", bbox_inches='tight')
+ds = xr.open_dataset(file)
+ds_clean = prepare_ds(ds, n_practices=None, standardise_items=False,
+                      clean_items=True, adjust_predictors="z-global")
+
+None
+
+
+
+
+
+
+
+

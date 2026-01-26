@@ -23,6 +23,7 @@ from scipy.spatial import cKDTree
 from joblib import Parallel, delayed
 from typing import List, Dict, Tuple
 
+# CONSTANTS =======================================================================================
 PRES_CODES = ['02_03_0501', '02', '03', '0501']
 PRES_LABELS = ['All', 'Cardiovascular', 'Respiratory', 'Antibiotics']
 PRES_COLOURS = ['black', 'red', 'blue', 'orange']
@@ -31,9 +32,11 @@ REGION_NAMES = ["North East", "North West", "Yorkshire and The Humber",
                 "East Midlands", "West Midlands", "East of England",
                 "London", "South West", "South East"]
 PRACTICE_SIZES = ["small", "large"]
-# ordered months with "September" last (reference category)
+# ordered months for seasonal plots
 MONTHS = ["January", "February", "March", "April", "May", "June",
           "July", "August", "September", "October", "November", "December"]
+
+
 
 # DATA FUNCTIONS ==================================================================================
 def add_hydrology_flags(prescriptions_ds, hydrology_ds,
@@ -943,6 +946,37 @@ def run_mixed_effects_models(
         except Exception:
             return np.nan, np.nan
 
+    # extract sum-to-zero categorical effects (calculate reference effect/CI)
+    def sum_to_zero_effects(mdf, prefix, categories):
+        effects_dict = {}
+        # collect non-reference coefficients
+        coef_names = [t for t in mdf.params.index if t.startswith(prefix)]
+        # covariance submatrix
+        cov = mdf.cov_params().loc[coef_names, coef_names]
+        
+        for term in coef_names:
+            # extract category name
+            raw = term.split("[")[1].rstrip("]")
+            cat = raw.replace("S.", "").replace("T.", "")
+            beta = mdf.params[term]
+            ci = tuple(safe_ci(mdf, term))
+            p = float(mdf.pvalues.get(term, np.nan))
+            effects_dict[cat] = {"beta": beta, "ci": ci, "p": p}
+
+        # identify missing (reference) category
+        missing = set(categories) - set(effects_dict.keys())
+        if len(missing) == 1:
+            ref = missing.pop()
+            beta_ref = -sum(v["beta"] for v in effects_dict.values())
+            # compute CI using covariance
+            var_ref = cov.to_numpy().sum()
+            se_ref = np.sqrt(var_ref)
+            ci_low = beta_ref - 1.96 * se_ref
+            ci_high = beta_ref + 1.96 * se_ref
+            effects_dict[ref] = {"beta": beta_ref, "ci": (ci_low, ci_high), "p": np.nan}
+
+        return effects_dict
+
     # convert log-coef to percent change
     def percent_from_log(beta):
         if pd.isna(beta):
@@ -1127,31 +1161,33 @@ def run_mixed_effects_models(
         out["imd_ci_high"] = cis[1]
         out["imd_p"] = float(mdf.pvalues.get("imd_centile_values", np.nan))
 
-        # region effects
-        for term in mdf.params.index:
-            if term.startswith("C(region"):
-                region = term.split("[")[1].rstrip("]")
-                beta = mdf.params.get(term, np.nan)
-                cis = tuple(percent_from_log(x) for x in safe_ci(mdf, term))
-                out["region_main"][region] = {
-                    "coef": percent_from_log(beta),
-                    "ci_low": cis[0],
-                    "ci_high": cis[1],
-                    "p": float(mdf.pvalues.get(term, np.nan)),
-                }
+        # region effects (in log space)
+        all_regions = df_model["region"].unique().tolist()
+        region_log = sum_to_zero_effects(mdf, prefix="C(region", categories=all_regions)
 
-        # month effects
-        for term in mdf.params.index:
-            if term.startswith("C(month"):
-                month = term.split("[")[1].rstrip("]")  # get month number as string
-                beta = mdf.params.get(term, np.nan)
-                cis = tuple(percent_from_log(x) for x in safe_ci(mdf, term))
-                out["month_main"][month] = {
-                    "coef": percent_from_log(beta),
-                    "ci_low": cis[0],
-                    "ci_high": cis[1],
-                    "p": float(mdf.pvalues.get(term, np.nan)),
-                }
+        # convert everything to percent
+        for region, v in region_log.items():
+            out["region_main"][region] = {
+                "coef": percent_from_log(v["beta"]),
+                "ci_low": percent_from_log(v["ci"][0]),
+                "ci_high": percent_from_log(v["ci"][1]),
+                "p": v["p"],
+            }
+
+        # month effects (in log space)
+        if deseasonalise_output:
+            month_log = sum_to_zero_effects(mdf, prefix="C(month", categories=MONTHS)
+        else:
+            month_log = {}
+
+        # convert everything to percent
+        for month, v in month_log.items():
+            out["month_main"][month] = {
+                "coef": percent_from_log(v["beta"]),
+                "ci_low": percent_from_log(v["ci"][0]),
+                "ci_high": percent_from_log(v["ci"][1]),
+                "p": v["p"],
+            }
 
         return out
 
@@ -1163,6 +1199,8 @@ def run_mixed_effects_models(
 
     # save results
     results_df = pd.DataFrame(results)
+    results_df["region_main"] = results_df["region_main"].apply(json.dumps)
+    results_df["month_main"] = results_df["month_main"].apply(json.dumps)
     csv_path = os.path.join(results_folder, "mixed_effects_results.csv")
     results_df.to_csv(csv_path, index=False)
     status(f"Saved results to {csv_path}", level=1)
@@ -1297,6 +1335,10 @@ def run_bayesian_model(
     fixed_cols = []  # for column names in X_fixed
     X_fixed_list = []  # list for numpy arrays in X_fixed
 
+    # orthogonalise imd_centile_values (center within region)
+    if "imd_centile_values" in df.columns:
+        df["imd_centile_values"] -= df.groupby("region")["imd_centile_values"].transform("mean")
+
     # continuous predictors
     if lag == 0:
         for var in raw_vars:
@@ -1344,18 +1386,29 @@ def run_bayesian_model(
 
     # random effect design matrices
     # use sparse matrix for practice random effects (many practices)
-    Z_practice = sp.csr_matrix(
+    Z_practice_intercept = sp.csr_matrix(
         (np.ones(n_obs, dtype="float32"), (np.arange(n_obs), practice_idx)),
         shape=(n_obs, n_practice)
     ).astype("float32")
     # slope RE only for practices with sufficient observations
     practice_counts_for_slope = df.groupby("practice_id").size()
-    slope_practices = practice_counts_for_slope[practice_counts_for_slope > min_obs_for_slope].index
-    slope_mask = df["practice_id"].isin(slope_practices).astype("float32").values
-    slope_practice_idx = pd.Categorical(
-        df["practice_id"].where(df["practice_id"].isin(slope_practices))
-    ).codes.astype("int32")
-    Z_region = np.eye(n_region, dtype="float32")[region_idx]
+    slope_practices = practice_counts_for_slope[
+        practice_counts_for_slope > min_obs_for_slope
+    ].index
+    slope_rows = df["practice_id"].isin(slope_practices)
+    Z_practice_slope = sp.csr_matrix(
+        (
+            date_code[slope_rows],
+            (
+                np.where(slope_rows)[0],
+                pd.Categorical(
+                    df.loc[slope_rows, "practice_id"],
+                    categories=slope_practices
+                ).codes
+            )
+        ),
+        shape=(len(df), len(slope_practices))
+    ).astype("float32")
 
     # categorise fixed effect columns
     env_idx   = [i for i, n in enumerate(fixed_cols) if classify_beta(n) == "environmental"]
@@ -1368,61 +1421,77 @@ def run_bayesian_model(
         # register data
         X_fixed_data = pm.Data("X_fixed", X_fixed)
         y_obs_data = pm.Data("y_obs", y_obs)
-        Z_practice_data = pts.as_sparse_variable(Z_practice)
-        Z_region_data = pm.Data("Z_region", Z_region)
+        Z_practice_intercept_data = pts.as_sparse_variable(Z_practice_intercept)
+        Z_practice_slope_data = pts.as_sparse_variable(Z_practice_slope)
         month_idx_data = pm.Data("month_idx", month_idx)
-        slope_mask_data = pm.Data("slope_mask", slope_mask)
-        slope_practice_idx_data = pm.Data("slope_practice_idx",
-                                          slope_practice_idx.astype("int32"))
+        region_idx_data = pm.Data("region_idx", region_idx)
         date_code_data = pm.Data("date_code", date_code)
 
-        # global intercept
-        alpha = pm.Normal("alpha", mu=y_mean, sigma=1.0)
-
-        # region-level intercepts
-        sigma_region = pm.HalfNormal("sigma_region", 0.5)
-        region_raw = pm.Normal("region_raw", 0.0, 1.0, shape=n_region)
-        region_mean = pm.Deterministic(
-            "region_mean", (region_raw - region_raw.mean()) * sigma_region
-        )
-        region_term = pm.math.dot(Z_region_data, region_mean)
+        # global intercept and slope
+        intercept = pm.Normal("intercept", mu=y_mean, sigma=0.5)
+        slope = pm.Normal("slope", 0.0, 0.05)
 
         # random effects
         if practice_correction == 0:
-            practice_intercept = 0.0
-            practice_slope_term = 0.0
+            practice_intercept_term = intercept
+            practice_slope_term = slope * date_code_data
         else:
-            # practice-level intercepts (non-centred)
-            sigma_practice = pm.HalfNormal("sigma_practice", 1.0)
-            practice_intercept_offset = pm.Normal("practice_intercept_offset", 0.0, 1.0, shape=n_practice)
-            practice_intercept = (
-                pm.math.dot(
-                    Z_practice_data,
-                    (practice_intercept_offset * sigma_practice)[:, None]
-                ).squeeze()
-            )
+            # practice-level intercepts
+            sigma_practice = pm.HalfNormal("sigma_practice", 0.5)
+            practice_intercept_offset = pm.Normal("practice_intercept_offset",
+                                                  0.0, 1.0,
+                                                  shape=n_practice)
+            practice_intercept_offset -= pm.math.mean(practice_intercept_offset)
+            practice_intercept = intercept + sigma_practice * practice_intercept_offset
+            practice_intercept_term = pm.math.dot(
+                Z_practice_intercept_data,
+                practice_intercept[:, None]
+            ).squeeze()
             # practice-level slopes (only for practice_correction == 2)
             if practice_correction == 2:
-                sigma_slope = pm.HalfNormal("sigma_slope", 0.5)
-                practice_slope_offset = pm.Normal("practice_slope_offset", 0.0, 1.0, shape=len(slope_practices))
-                slope_re = practice_slope_offset * sigma_slope
-                practice_slope_term = slope_mask_data * slope_re[slope_practice_idx_data] * date_code_data
+                sigma_slope = pm.HalfNormal("sigma_slope", 0.1)
+                practice_slope_offset = pm.Normal("practice_slope_offset",
+                                                  0.0, 1.0,
+                                                  shape=len(slope_practices))
+                practice_slope = slope + practice_slope_offset * sigma_slope
+                practice_slope_term = pm.math.dot(
+                    Z_practice_slope_data,
+                    practice_slope[:, None]
+                ).squeeze()
             else:
-                practice_slope_term = 0.0
+                practice_slope_term = slope * date_code_data
+
+        # # region fixed effects
+        # region_raw = pm.Normal("region_raw", 0.0, 0.5, shape=n_region)
+        # region_effect = pm.Deterministic(
+        #                     "region_effect",
+        #                     region_raw - pm.math.mean(region_raw)
+        #                 )
+        # region_term = region_effect[region_idx_data]
+
+        # region pooled effects
+        sigma_region = pm.HalfNormal("sigma_region", 0.2)
+        region_offset = pm.Normal("region_offset", 0.0, 1.0, shape=n_region)
+        region_effect = pm.Deterministic(
+            "region_effect",
+            (region_offset - pm.math.mean(region_offset)) * sigma_region
+        )
+        region_term = region_effect[region_idx_data]
 
         # seasonal effects
         if deseasonalise_output:
             sigma_month = pm.HalfNormal("sigma_month", 0.3)
             month_raw = pm.Normal("month_raw", 0.0, 1.0, shape=12)
-            month_effect = pm.Deterministic("month_effect",
-                                            (month_raw - month_raw.mean()) * sigma_month
+            month_effect = pm.Deterministic(
+                "month_effect",
+                (month_raw - month_raw.mean()) * sigma_month
             )
             month_term = month_effect[month_idx_data]
         else:
             month_term = 0.0
 
         # fixed effects
-        tau_env = pm.HalfNormal("tau_env", 0.5)
+        tau_env = pm.HalfNormal("tau_env", 0.2)
         beta_env = pm.Normal("beta_env", mu=0.0, sigma=tau_env, shape=len(env_idx))
         beta_flood = pm.Normal("beta_flood", mu=0.0, sigma=1.0, shape=len(flood_idx))
         # beta_month = pm.Normal("beta_month", mu=0.0, sigma=0.5, shape=len(month_idx))
@@ -1434,18 +1503,15 @@ def run_bayesian_model(
                 beta_list.append(beta_env[env_idx.index(i)])
             elif i in flood_idx:
                 beta_list.append(beta_flood[flood_idx.index(i)])
-            # elif i in month_idx:
-            #     beta_list.append(beta_month[month_idx.index(i)])
             else:
                 raise ValueError(f"Variable {fixed_cols[i]} not categorised for beta assembly")
         beta = pm.Deterministic("beta", pm.math.stack(beta_list, axis=0))
 
         # full eta equation
-        eta = alpha + \
-              region_term + \
-              practice_intercept + \
+        eta = practice_intercept_term + \
               practice_slope_term + \
               month_term + \
+              region_term + \
               pm.math.dot(X_fixed_data, beta)
 
         # residual
@@ -1465,8 +1531,8 @@ def run_bayesian_model(
                 tune=tune,
                 chains=chains,
                 cores=1,
-                target_accept=0.95,
-                max_tree_depth=15,
+                target_accept=0.98,
+                max_tree_depth=19,
                 nuts_sampler="numpyro",
                 nuts_sampler_kwargs={"chain_method": "vectorized"},
             )
@@ -1476,17 +1542,17 @@ def run_bayesian_model(
                 tune=tune,
                 chains=chains,
                 cores=cores,
-                target_accept=0.95,
-                max_tree_depth=15,
+                target_accept=0.98,
+                max_tree_depth=19,
             )
 
     # save inference data =========================================================================
-    # recombined beta objects
+    # remove individual beta components
     drop_beta_components = ["beta_env", "beta_flood"]
     existing = [v for v in drop_beta_components if v in idata.posterior.data_vars]
     idata.posterior = idata.posterior.drop_vars(existing)
 
-    # restructure inference data for named predictors
+    # expand beta to named predictors
     beta_da = idata.posterior["beta"]
     named_betas = {
         name: beta_da.isel(beta_dim_0=i).drop_vars("beta_dim_0")
@@ -1496,29 +1562,26 @@ def run_bayesian_model(
     idata.posterior = xr.merge([idata.posterior, xr.Dataset(named_betas)])
 
     # replace categorical codes with names
-    def map_hierarchical_vars(idata):
-        hierarchical_mappings = {
-            "region_mean": REGION_NAMES,
-            "region_raw": REGION_NAMES,
-            "month_effect": MONTHS,
-            "month_raw": MONTHS,
-        }
-        new_vars = {}
-        vars_to_drop = []
-        for var, names in hierarchical_mappings.items():
-            if var not in idata.posterior:
-                continue
-            da = idata.posterior[var]
-            dim = da.dims[-1]
-            for i, name in enumerate(names):
-                new_name = f"{var}[{name}]"
-                new_vars[new_name] = da.isel({dim: i}).drop_vars(dim)
-            vars_to_drop.append(var)
-        if new_vars:
-            idata.posterior = idata.posterior.drop_vars(vars_to_drop)
-            idata.posterior = xr.merge([idata.posterior, xr.Dataset(new_vars)])
-        return idata
-    idata = map_hierarchical_vars(idata)
+    hierarchical_mappings = {
+        "region_effect": REGION_NAMES,
+        "region_raw": REGION_NAMES,
+        "month_effect": MONTHS,
+        "month_raw": MONTHS,
+    }
+    new_vars = {}
+    vars_to_drop = []
+    for var, names in hierarchical_mappings.items():
+        if var not in idata.posterior:
+            continue
+        da = idata.posterior[var]
+        dim = da.dims[-1]
+        for i, name in enumerate(names):
+            new_name = f"{var}[{name}]"
+            new_vars[new_name] = da.isel({dim: i}).drop_vars(dim)
+        vars_to_drop.append(var)
+    if new_vars:
+        idata.posterior = idata.posterior.drop_vars(vars_to_drop)
+        idata.posterior = xr.merge([idata.posterior, xr.Dataset(new_vars)])
 
     # compute and save lag effects
     if lag > 0:
@@ -1539,11 +1602,34 @@ def run_bayesian_model(
             idata.posterior = xr.merge([idata.posterior,
                                         xr.Dataset(lag_effect_vars)])
 
-    # save posterior summary with categorical names
+    # calculate percentage highest-density intervals for CSV output
     summary_df = az.summary(idata, hdi_prob=0.95)
     summary_df["mean_pct"] = 100 * (np.exp(summary_df["mean"]) - 1)
     summary_df["hdi_2.5pc_pct"] = 100 * (np.exp(summary_df["hdi_2.5%"]) - 1)
     summary_df["hdi_97.5pc_pct"] = 100 * (np.exp(summary_df["hdi_97.5%"]) - 1)
+
+    # calculate percentage equal-tailed intervals for CSV output
+    posterior = idata.posterior
+    eti_mean = []
+    eti_lo = []
+    eti_hi = []
+    for param in summary_df["index"]:
+        if param not in posterior:
+            eti_mean.append(np.nan)
+            eti_lo.append(np.nan)
+            eti_hi.append(np.nan)
+        else:
+            samples = posterior[param].values.flatten()
+            mean = 100 * np.expm1(samples.mean())
+            lo, hi = 100 * np.expm1(np.quantile(samples, [0.025, 0.975]))
+            eti_mean.append(mean)
+            eti_lo.append(lo)
+            eti_hi.append(hi)
+    summary_df["eti_mean_pct"] = eti_mean
+    summary_df["eti_2.5pc_pct"] = eti_lo
+    summary_df["eti_97.5pc_pct"] = eti_hi
+
+    # save summary to CSV
     summary_df = summary_df.reset_index().rename(columns={"index": "parameter"})
     summary_csv = os.path.join(results_folder, "bayesian_model_summary.csv")
     summary_df.to_csv(summary_csv, index=False)
@@ -1573,7 +1659,7 @@ def prepare_ds(
         clean_items=False,
         adjust_predictors=None,
         deseasonalise_predictors=False,
-        practice_mean_thresh=500,
+        practice_mean_thresh=None,
     ):
     """
     Prepare dataset for analysis by adding date_code, limiting practices and
@@ -1635,6 +1721,14 @@ def prepare_ds(
                     if adjust_predictors == "z-global":
                         std = ds[var].std().item() + 1e-8  # prevent div by zero
                         ds[var] = ds[var] / std
+        elif adjust_predictors == ["c-practice-z-global"]:
+            status("Centering predictor values per practice and standardising globally", level=1)
+            for var in ds.data_vars:
+                if var.endswith("_values"):
+                    mean_prac = ds[var].mean(dim="date")
+                    std = ds[var].std().item() + 1e-8  # prevent div by zero
+                    ds[var] = ds[var] - mean_prac
+                    ds[var] = ds[var] / std
         else:
             raise ValueError(f"Unknown adjust_predictors method: {adjust_predictors}")
     
@@ -2060,7 +2154,8 @@ def compare_mixed_models(results_folder, save_folder, legend_y_offset_px=42):
     region_dfs = []
     for code, df in all_results.items():
         for _, row in df.iterrows():
-            region_dict = ast.literal_eval(row["region_main"])
+            # region_dict = ast.literal_eval(row["region_main"].replace("nan", ""))
+            region_dict = json.loads(row["region_main"])
             for region, val in region_dict.items():
                 region_dfs.append({
                     "name": region,
@@ -2074,7 +2169,7 @@ def compare_mixed_models(results_folder, save_folder, legend_y_offset_px=42):
     region_df_list = [region_dfs[region_dfs["pres_code"] == code] for code in PRES_CODES]
     fig_region, ax_region = plot_combined(region_df_list, PRES_LABELS, PRES_COLOURS,
                                           x_label=f"Deviation from national mean (%)",
-                                          region_plot=True, order=REGION_NAMES)
+                                          duplicated_vars=True, order=REGION_NAMES)
     add_legend(fig_region, ax_region, labels=PRES_LABELS, legend_y_offset_px=legend_y_offset_px)
     fig_region.savefig(os.path.join(save_folder, "mixed_region.png"), dpi=600, bbox_inches='tight')
     plt.close(fig_region)
@@ -2083,12 +2178,11 @@ def compare_mixed_models(results_folder, save_folder, legend_y_offset_px=42):
     month_dfs = []
     for code, df in all_results.items():
         for _, row in df.iterrows():
-            month_dict = ast.literal_eval(row.get("month_main", "{}"))
-            for month_num_str, val in month_dict.items():
-                # convert to int index
-                month_idx = int(month_num_str) - 1  # month T.1 -> 0, T.2 -> 1, etc.
+            # month_dict = ast.literal_eval(row.get("month_main", "{}"))
+            month_dict = json.loads(row.get("month_main", "{}"))
+            for month_name, val in month_dict.items():
                 month_dfs.append({
-                    "name": MONTHS[month_idx],
+                    "name": month_name,
                     "coef": val["coef"],
                     "ci_low": val["ci_low"],
                     "ci_high": val["ci_high"],
@@ -2099,12 +2193,13 @@ def compare_mixed_models(results_folder, save_folder, legend_y_offset_px=42):
     month_df_list = [month_dfs[month_dfs["pres_code"] == code] for code in PRES_CODES]
     fig_month, ax_month = plot_combined(month_df_list, PRES_LABELS, PRES_COLOURS,
                                         x_label="Deviation from annual mean (%)",
-                                        order=MONTHS)
+                                        duplicated_vars=True, order=MONTHS)
     add_legend(fig_month, ax_month, labels=PRES_LABELS, legend_y_offset_px=legend_y_offset_px)
     fig_month.savefig(os.path.join(save_folder, "mixed_months.png"), dpi=600, bbox_inches='tight')
     plt.close(fig_month)
 
-def compare_bayesian_models(results_root):
+def compare_bayesian_models(results_root, hide_vars=None, mean_name="mean_pct",
+                            lower_name="hdi_2.5pc_pct", upper_name="hdi_97.5pc_pct"):
     results_folders = [os.path.join(results_root, c) for c in PRES_CODES]
     plot_root = results_root
 
@@ -2120,7 +2215,7 @@ def compare_bayesian_models(results_root):
 
         # exclude random effects
         exclude_pattern = (
-            r"^alpha$|^Intercept$|^sigma(?:$|_)|"
+            r"^alpha$|^intercept$|^slope$|^sigma(?:$|_)|"
             r"^sigma_|^region_|^size_|^month_|^practice_|"
             r"_raw$|_offset$|"
             r"^slope_re$|^practice_slope_offset$|"
@@ -2167,13 +2262,16 @@ def compare_bayesian_models(results_root):
         lags = sorted({l for df in lagged_dataframes for l in df["lag"].unique()})
         for lag in lags:
             df_list = [extract_lag_values(df, lag) for df in lagged_dataframes]
+            if hide_vars is not None:
+                for j in range(len(df_list)):
+                    df_list[j] = df_list[j][~df_list[j]["variable"].isin(hide_vars)]
             fig, ax = plot_combined(
                 df_list=df_list,
                 labels_list=[PRES_LABELS[i] for i in lagged_data_inds],
                 colours_list=[PRES_COLOURS[i] for i in lagged_data_inds],
-                col_est="mean_pct",
-                col_low="hdi_2.5pc_pct",
-                col_high="hdi_97.5pc_pct",
+                col_est=mean_name,
+                col_low=lower_name,
+                col_high=upper_name,
                 x_label=f"Effect estimate for {lag} months lag (%)",
             )
             fig.tight_layout()
@@ -2191,22 +2289,26 @@ def compare_bayesian_models(results_root):
                 labels=[PRES_LABELS[i] for i in lagged_data_inds],
                 colours=[PRES_COLOURS[i] for i in lagged_data_inds],
                 outpath=os.path.join(lag_plot_folder, f"{var}.png"),
-                col_est="mean_pct",
-                col_low="hdi_2.5pc_pct",
-                col_high="hdi_97.5pc_pct",
+                col_est=mean_name,
+                col_low=lower_name,
+                col_high=upper_name,
             )
         status(f"Per-variable lag plots saved to {lag_plot_folder}", level=1)
 
     # combined numeric predictor plot
     elif numeric_dataframes:
         status("Generating combined predictor plot...", level=1)
+        df_list = numeric_dataframes.copy()
+        if hide_vars is not None:
+            for j in range(len(df_list)):
+                df_list[j] = df_list[j][~df_list[j]["name"].isin(hide_vars)]
         fig, ax = plot_combined(
-            df_list=numeric_dataframes,
+            df_list=df_list,
             labels_list=[PRES_LABELS[i] for i in numeric_data_inds],
             colours_list=[PRES_COLOURS[i] for i in numeric_data_inds],
-            col_est="mean_pct",
-            col_low="hdi_2.5pc_pct",
-            col_high="hdi_97.5pc_pct",
+            col_est=mean_name,
+            col_low=lower_name,
+            col_high=upper_name,
             x_label="Effect estimate (%)"
         )
         fig.tight_layout()
@@ -2232,19 +2334,21 @@ def compare_bayesian_models(results_root):
                 colours=[PRES_COLOURS[i] for i in numeric_data_inds],
                 var_extractor=bayes_extractor,
                 outpath=os.path.join(plot_folder, f"{var}.png"),
-                col_est="mean_pct",
-                col_low="hdi_2.5pc_pct",
-                col_high="hdi_97.5pc_pct",
+                col_est=mean_name,
+                col_low=lower_name,
+                col_high=upper_name,
             )
         status(f"Per-variable predictor plots saved to {plot_folder}", level=1)
 
     # regional effects
     status("Generating regional effects plot...", level=1)
-    plot_regions_bayes(results_folders, plot_root)
+    plot_regions_bayes(results_folders, plot_root,
+                       mean_name=mean_name, lower_name=lower_name, upper_name=upper_name)
 
     # seasonal effects
     status("Generating month effects plot...", level=1)
-    plot_months_bayes(results_folders, plot_root)
+    plot_months_bayes(results_folders, plot_root,
+                      mean_name=mean_name, lower_name=lower_name, upper_name=upper_name)
 
 # ANALYSIS HELPERS --------------------------------------------------------------------------------
 def plot_combined(
@@ -2256,7 +2360,7 @@ def plot_combined(
     xlim: tuple = (None, None),
     y_jitter: float = 0.15,
     hide_sulphur: bool = False,
-    region_plot: bool = False,
+    duplicated_vars: bool = False,
     order: list = None,
     col_est: str = "coef",
     col_low: str = "ci_low",
@@ -2272,7 +2376,7 @@ def plot_combined(
 
     # create figure if needed
     if ax is None:
-        if region_plot:
+        if duplicated_vars:
             height = 1 + len(np.unique(df_list[0]["name"]))*5/18
         else:
             height = 1 + len(df_list[0])*5/18
@@ -2339,7 +2443,7 @@ def plot_variable(
         col_est="coef",
         col_low="ci_low",
         col_high="ci_high",
-        figsize=(6, 4)
+        figsize=(10, 2)
 ):
     """
     Generic helper for making per-variable coefficient/mean plots.
@@ -2379,11 +2483,12 @@ def plot_variable(
         plt.close(fig)
         return
 
+    ax.set_ylim(-0.5, 3.5)
     ax.axvline(0, color="black", alpha=0.8, label="_nolegend_")
     ax.grid(alpha=0.8, zorder=-2)
-    ax.set_xlabel("Effect estimate")
+    ax.set_xlabel("Effect estimate (%)")
     fig.tight_layout()
-    fig.savefig(outpath, bbox_inches='tight')
+    fig.savefig(outpath, bbox_inches='tight', dpi=600)
     plt.close(fig)
 
 def extract_lag_values(df, lag):
@@ -2450,7 +2555,8 @@ def plot_prior_distributions(ds):
         plt.savefig(f"outputs/prior_test/{var}.png")
         plt.close()
 
-def plot_regions_bayes(results_folders, plot_root):
+def plot_regions_bayes(results_folders, plot_root, mean_name="mean_pct",
+                       lower_name="hdi_2.5pc_pct", upper_name="hdi_97.5pc_pct"):
     """
     Plots regional effects across prescription types from Bayesian model summaries.
     Effects are deviations from the national mean (centred hierarchical intercepts).
@@ -2466,7 +2572,7 @@ def plot_regions_bayes(results_folders, plot_root):
         df = pd.read_csv(summary_path).rename(columns={"parameter": "name"})
 
         # extract relative regional effects
-        region_rows = df[df["name"].str.startswith("region_mean")]
+        region_rows = df[df["name"].str.startswith("region_effect")]
         if region_rows.empty:
             continue
         region_data = []
@@ -2474,9 +2580,9 @@ def plot_regions_bayes(results_folders, plot_root):
             region_name = row["name"].split("[")[1].replace("]", "")
             region_data.append({
                 "name": region_name,
-                "coef": row["mean_pct"],
-                "ci_low": row["hdi_2.5pc_pct"],
-                "ci_high": row["hdi_97.5pc_pct"],
+                "coef": row[mean_name],
+                "ci_low": row[lower_name],
+                "ci_high": row[upper_name],
             })
 
         # add to dataframe list
@@ -2494,7 +2600,7 @@ def plot_regions_bayes(results_folders, plot_root):
         labels_list=labels,
         colours_list=colours,
         x_label="Deviation from national mean (%)",
-        region_plot=True,
+        duplicated_vars=True,
         order=REGION_NAMES,
         col_est="coef",
         col_low="ci_low",
@@ -2513,7 +2619,8 @@ def plot_regions_bayes(results_folders, plot_root):
     plt.close(fig_region)
     status(f"Bayesian regional effects plot saved to {plot_root}compare_regions.png", level=1)
 
-def plot_months_bayes(results_folders, plot_root):
+def plot_months_bayes(results_folders, plot_root, mean_name="mean_pct",
+                      lower_name="hdi_2.5pc_pct", upper_name="hdi_97.5pc_pct"):
     """
     Plots month effects across prescription types from Bayesian model summaries.
     Month coefficients are named month[1] ... month[12], with one omitted
@@ -2537,8 +2644,8 @@ def plot_months_bayes(results_folders, plot_root):
 
         # add to list
         month_dfs.append(
-            month_rows[["name", "mean_pct",
-                        "hdi_2.5pc_pct", "hdi_97.5pc_pct"]]
+            month_rows[["name", mean_name,
+                        lower_name, upper_name]]
         )
         labels.append(PRES_LABELS[i])
         colours.append(PRES_COLOURS[i])
@@ -2554,9 +2661,9 @@ def plot_months_bayes(results_folders, plot_root):
         colours_list=colours,
         x_label=f"Deviation from annual mean (%)",
         order=MONTHS,
-        col_est="mean_pct",
-        col_low="hdi_2.5pc_pct",
-        col_high="hdi_97.5pc_pct",
+        col_est=mean_name,
+        col_low=lower_name,
+        col_high=upper_name,
     )
 
     # finalise plot

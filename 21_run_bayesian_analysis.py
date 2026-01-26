@@ -183,7 +183,6 @@ if __name__ == "__main__":
     status(f"clean_items: {clean_items},", level=2)
     status(f"adjust_predictors: {adjust_predictors},", level=2)
     status(f"deseasonalise_predictors: {deseasonalise_predictors},", level=2)
-    status(f"practice_mean_thresh: {practice_mean_thresh}", level=2)
     status("Predictor variables:", level=1)
     [status(f"{predictor}", level=2) for predictor in predictors]
     status("Non-lagged variables:", level=1)
@@ -197,8 +196,7 @@ if __name__ == "__main__":
                     standardise_items=standardise_items,
                     clean_items=clean_items,
                     adjust_predictors=adjust_predictors,
-                    deseasonalise_predictors=deseasonalise_predictors,
-                    practice_mean_thresh=practice_mean_thresh)
+                    deseasonalise_predictors=deseasonalise_predictors)
 
     # run the bayesian models
     status("Initialising model run...")
@@ -228,6 +226,8 @@ if __name__ == "__main__":
 
     # running model comparisons
     status("Comparing model results...")
-    compare_bayesian_models("/".join(results_folder.split("/")[:-2]) + "/")
+    compare_bayesian_models("/".join(results_folder.split("/")[:-2]) + "/",
+                            hide_vars=["imd_centile_values"], mean_name="eti_mean_pct",
+                            lower_name="eti_2.5pc_pct", upper_name="eti_97.5pc_pct")
 
     status("Script complete.")

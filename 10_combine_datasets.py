@@ -10,20 +10,20 @@ prescriptions_paths = [
     "data/prescriptions_03_2010-08_2025-08.nc",
     "data/prescriptions_0501_2010-08_2025-08.nc"
 ]
-# hydrology_path = "data/hydrology_rainfall_stations.nc"
-# geojson_path = "data/Recorded_Flood_Outlines.geojson"
-# met_path = "data/met_office_stations.nc"
-# particulates_path = "data/particulates_by_practice_monthly_max.nc"
-# deprivation_path = "data/local_authority_district_index_multiple_deprivation_centiles.nc"
+hydrology_path = "data/hydrology_rainfall_stations.nc"
+geojson_path = "data/Recorded_Flood_Outlines.geojson"
+met_path = "data/met_office_stations.nc"
+particulates_path = "data/particulates_by_practice_monthly_max.nc"
+deprivation_path = "data/local_authority_district_index_multiple_deprivation_centiles.nc"
 regions_path = "data/england_regions.geojson"
 
 # load datasets
 print("Loading datasets...")
-# hydrology_ds = xr.open_dataset(hydrology_path)
-# flood_geojson = load_json(geojson_path)
-# met_ds = xr.open_dataset(met_path)
-# particulates_ds = xr.load_dataset(particulates_path)
-# deprivation_ds = xr.load_dataset(deprivation_path)
+hydrology_ds = xr.open_dataset(hydrology_path)
+flood_geojson = load_json(geojson_path)
+met_ds = xr.open_dataset(met_path)
+particulates_ds = xr.load_dataset(particulates_path)
+deprivation_ds = xr.load_dataset(deprivation_path)
 regions_geojson = load_json(regions_path)
 print("Datasets loaded.")
 
@@ -51,16 +51,16 @@ for prescriptions_path in prescriptions_paths:
     prescriptions_ds = xr.load_dataset(prescriptions_path)
 
     # add the various flags
-    # print("  Adding Hydrology rain flags...")
-    # prescriptions_ds = add_hydrology_flags(prescriptions_ds, hydrology_ds, seasonal_correction=seasonal_correction)
-    # print("  Adding Flood GeoJSON flags...")
-    # prescriptions_ds = add_geojson_flood_flags(prescriptions_ds, flood_geojson)
-    # print("  Adding MET Office flags...")
-    # prescriptions_ds = add_met_flags(prescriptions_ds, met_ds, seasonal_correction=seasonal_correction)
-    # print("  Adding Particulate flags...")
-    # prescriptions_ds = add_particulate_flags(prescriptions_ds, particulates_ds, seasonal_correction=seasonal_correction)
-    # print("  Adding deprivation data...")
-    # prescriptions_ds = add_deprivation_index(prescriptions_ds, deprivation_ds)
+    print("  Adding Hydrology rain flags...")
+    prescriptions_ds = add_hydrology_flags(prescriptions_ds, hydrology_ds, seasonal_correction=seasonal_correction)
+    print("  Adding Flood GeoJSON flags...")
+    prescriptions_ds = add_geojson_flood_flags(prescriptions_ds, flood_geojson)
+    print("  Adding MET Office flags...")
+    prescriptions_ds = add_met_flags(prescriptions_ds, met_ds, seasonal_correction=seasonal_correction)
+    print("  Adding Particulate flags...")
+    prescriptions_ds = add_particulate_flags(prescriptions_ds, particulates_ds, seasonal_correction=seasonal_correction)
+    print("  Adding deprivation data...")
+    prescriptions_ds = add_deprivation_index(prescriptions_ds, deprivation_ds)
     print("  Adding Regions...")
     prescriptions_ds = add_practice_regions(prescriptions_ds, regions_geojson)
 
