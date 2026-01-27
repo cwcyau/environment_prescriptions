@@ -190,13 +190,14 @@ import matplotlib.pyplot as plt
 import xarray as xr
 from funcs import clean_prescription_items, prepare_ds
 
-file = "data/prescriptions_02_03_0501_2010-08_2025-08_with_flags.nc"
+folder = "outputs/article_bayes_standard/"
+pres_codes = ['02', '03', '0501', '02_03_0501']
+files = [f"{folder}{code}/bayesian_model_idata.nc" for code in pres_codes]
 
-ds = xr.open_dataset(file)
-ds_clean = prepare_ds(ds, n_practices=None, standardise_items=False,
-                      clean_items=True, adjust_predictors="z-global")
-
-None
+for file in files:
+    ds = xr.open_dataset(file, group="posterior")
+    with open(f"{file.replace('.nc', '')}_posterior.txt", "w") as f:
+        f.write(str(ds))
 
 
 
