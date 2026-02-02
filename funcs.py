@@ -2350,6 +2350,112 @@ def compare_bayesian_models(results_root, hide_vars=None, mean_name="mean_pct",
     plot_months_bayes(results_folders, plot_root,
                       mean_name=mean_name, lower_name=lower_name, upper_name=upper_name)
 
+def combined_lagged_predictor_plot(results_root, hide_vars=["imd_centile_values"], mean_name="mean_pct",
+                                   lower_name="hdi_2.5pc_pct", upper_name="hdi_97.5pc_pct"):
+    results_folders = [os.path.join(results_root, c) for c in PRES_CODES]
+    plot_root = results_root
+
+    lagged_dataframes, lagged_data_inds = [], []
+
+    for i, folder in enumerate(results_folders):
+        summary_path = os.path.join(folder, "bayesian_model_summary.csv")
+        if not os.path.exists(summary_path):
+            status(f"Warning: results not found at {summary_path}, skipping...", level=1)
+            continue
+
+        df = pd.read_csv(summary_path).rename(columns={"parameter": "name"})
+
+        # exclude random effects
+        exclude_pattern = (
+            r"^alpha$|^intercept$|^slope$|^sigma(?:$|_)|"
+            r"^sigma_|^region_|^size_|^month_|^practice_|"
+            r"_raw$|_offset$|"
+            r"^slope_re$|^practice_slope_offset$|"
+            r"^alpha_size(?:\[.*\])?$|"
+            r"^mu_alpha$|^tau_env$"
+        )
+        df = df[~df["name"].str.contains(exclude_pattern, regex=True)]
+
+        # identify lagged variables
+        lagged_rows = df[df["name"].str.contains(r"_lag_effect\[\d+\]")].copy()
+        if not lagged_rows.empty:
+            # extract variable name and lag
+            lagged_rows["variable"] = lagged_rows["name"].str.replace(
+                r"_lag_effect\[\d+\]", "", regex=True
+            )
+            lagged_rows["lag"] = (lagged_rows["name"].str.extract(r"\[(\d+)\]").astype(int))
+
+            # add non-lagged variables with lag = 0
+            non_lagged_rows = df[df["name"].str.endswith("_values")].copy()
+            if not non_lagged_rows.empty:
+                non_lagged_rows["variable"] = non_lagged_rows["name"]
+                non_lagged_rows["lag"] = 0
+            
+            # combine
+            lagged_rows = pd.concat([lagged_rows, non_lagged_rows], ignore_index=True)
+            lagged_dataframes.append(lagged_rows)
+            lagged_data_inds.append(i)
+
+    if not lagged_dataframes:
+        raise FileNotFoundError("No Bayesian results found — nothing to plot.")
+
+    os.makedirs(plot_root, exist_ok=True)
+
+    status("Generating per-variable Almon lag plots...", level=1)
+    variables = sorted({v for df in lagged_dataframes for v in df["variable"].unique()})
+    variables = [v for v in variables if v not in hide_vars]
+    lagged_dataframes = [df[df['variable'].isin(variables)] for df in lagged_dataframes]
+    n_vars = len(variables)
+    n_rows = int(np.ceil(n_vars / 2))
+    fig, axes = plt.subplots(n_rows, 2, figsize=(10, n_rows * 2.2))
+    # set common y-limits
+    # max_y = np.max([df[upper_name].max() for df in lagged_dataframes])
+    # min_y = np.min([df[lower_name].min() for df in lagged_dataframes])
+    min_y, max_y = -4.1, 4.1
+    y_range = max_y - min_y
+    for var, ax in zip(variables, axes.flatten()):
+        plot_lagged_variable(
+            var=var,
+            dataframes=lagged_dataframes,
+            labels=[PRES_LABELS[i] for i in lagged_data_inds],
+            colours=[PRES_COLOURS[i] for i in lagged_data_inds],
+            outpath=None,
+            col_est=mean_name,
+            col_low=lower_name,
+            col_high=upper_name,
+            use_ax=ax,
+        )
+        ax.set_ylim(min_y - 0.07 * y_range, max_y + 0.07 * y_range)
+        ax.set_yticks(np.arange(-4, 5, 2, dtype=int))
+        ax.set_title(var_name_to_plot_name(var))
+        ax.set_ylabel("Effect estimate (%)")
+        ax.set_xlabel("Lag (months)")
+        ax.set_xticks(sorted({int(l) for df in lagged_dataframes for l in df["lag"].unique()}))
+
+    fig.tight_layout()
+
+    # legend placement
+    renderer = fig.canvas.get_renderer()
+    bbox = axes[-1, -1].get_window_extent(renderer=renderer)
+    axes_height_px = bbox.height
+    y_offset_frac = 42 / axes_height_px
+    ax = axes[-1, -1]
+    handles, _ = ax.get_legend_handles_labels()
+    ax.legend(
+        handles=handles,
+        labels=PRES_LABELS,
+        loc='upper center',
+        bbox_to_anchor=(-0.1, -y_offset_frac),
+        bbox_transform=ax.transAxes,
+        ncol=4,
+        frameon=False
+    )
+
+    fig.savefig(os.path.join(plot_root, "compare_predictors_lagged_all.png"), dpi=600, bbox_inches='tight')
+    plt.close(fig)
+    
+    status(f"Per-variable lag plots saved to {plot_root}", level=1)
+
 # ANALYSIS HELPERS --------------------------------------------------------------------------------
 def plot_combined(
     df_list: list,
@@ -2501,11 +2607,15 @@ def plot_lagged_variable(
         col_est="mean_pct",
         col_low="hdi_2.5pc_pct",
         col_high="hdi_97.5pc_pct",
-        figsize=(6, 4)
+        figsize=(6, 4),
+        use_ax=None
 ):
-    fig, ax = plt.subplots(figsize=figsize)
-    matched = False
+    if use_ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        ax = use_ax
 
+    matched = False
     for df, label, colour in zip(dataframes, labels, colours):
         sub = df[df["variable"] == var].sort_values("lag")
         if sub.empty:
@@ -2527,13 +2637,14 @@ def plot_lagged_variable(
 
     ax.axhline(0, color="black", alpha=0.5)
     ax.grid(alpha=0.7)
-    ax.set_xlabel("Lag (months)")
-    ax.set_ylabel("Effect (%)")
-    ax.set_title(var)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(outpath, bbox_inches="tight", dpi=300)
-    plt.close(fig)
+    if use_ax is None:
+        ax.set_xlabel("Lag (months)")
+        ax.set_ylabel("Effect (%)")
+        ax.set_title(var)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(outpath, bbox_inches="tight", dpi=300)
+        plt.close(fig)
 
 def plot_prior_distributions(ds):
     values_vars = [var for var in ds.data_vars if var.endswith("_values")]

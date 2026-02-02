@@ -4,7 +4,7 @@ import pandas as pd
 import os
 
 root = "outputs/bayes_lagged_2/"
-folders = ["02_03_0501", "02", "03", "0501"]
+folders = ["0501"]  # ["02_03_0501", "02", "03", "0501"]
 results_folders = [os.path.join(root, folder) for folder in folders]
 
 predictors = [
